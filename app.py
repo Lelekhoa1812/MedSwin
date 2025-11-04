@@ -181,20 +181,29 @@ def _strip_disclaimers(text: str) -> str:
 
 
 def _build_fallback_chat_prompt(messages):
-    # Simple, widely-tolerated format
-    parts = []
-    sys_lines = [m["content"] for m in messages if m.get("role") == "system"]
-    if sys_lines:
-        sys_block = "\n".join(sys_lines)
-        parts.append("System:\n" + sys_block + "\n")
+    # Messages: list of {"role": system|user|assistant, "content": str}
+    # Build a simple Q/A transcript without the tokens "User:"/"Assistant:"
+    sys_blocks = [m.get("content","").strip() for m in messages if m.get("role") == "system"]
+    sys_text = "\n".join([b for b in sys_blocks if b])
+
+    convo = []
     for m in messages:
-        role = m.get("role", "user")
+        role = m.get("role")
+        content = (m.get("content","") or "").strip()
+        if not content:
+            continue
         if role == "user":
-            parts.append(f"User:\n{m.get('content','').strip()}\n")
+            convo.append(f"Q: {content}")
         elif role == "assistant":
-            parts.append(f"Assistant:\n{m.get('content','').strip()}\n")
-    parts.append("Assistant:\n")  # generation cue
-    return "\n".join(parts)
+            convo.append(f"A: {content}")
+
+    return (
+        "### System\n"
+        f"{sys_text}\n\n"
+        "### Conversation\n"
+        + "\n".join(convo) +
+        "\nA: "  # generation cue; we strip the leading 'A:' after generation
+    )
 
 
 def build_prompt(messages, tokenizer, system_prompt: str, context: str, source_info: str):
@@ -741,14 +750,14 @@ def create_demo():
                     system_prompt = gr.Textbox(
                         value=(
                             "You are a cautious, evidence-focused medical assistant.\n"
-                            "- Use the provided document context when available; if missing or insufficient, say what is needed.\n"
-                            "- Answer directly in clinical language, concise (≤150 words).\n"
-                            "- Do NOT restate disclaimers, and do NOT mention that you are an AI.\n"
-                            "- Cite source filenames in brackets only if used (e.g., [guideline.pdf]).\n"
-                            "- Avoid meta-commentary and apologies."
+                            "- Write directly to the user in second person (use 'you'); never say 'the user' or 'the patient'.\n"
+                            "- Be concise (≤150 words). Use clinical language and bullet points only if helpful.\n"
+                            "- If context is insufficient, say exactly what is missing. Do not fabricate.\n"
+                            "- If you used provided documents, cite filenames in brackets (e.g., [guideline.pdf]).\n"
+                            "- Do not include disclaimers, meta-commentary, or references to being an AI."
                         ),
                         label="System Prompt",
-                        lines=4
+                        lines=5
                     )
                     gr.Markdown(
                         "**Clinical Use Disclaimer:** This application is intended for informational purposes only and does not constitute medical advice. "
