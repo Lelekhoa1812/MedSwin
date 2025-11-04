@@ -129,6 +129,20 @@ global_model = None
 global_tokenizer = None
 global_file_info = {}
 
+def _build_fallback_chat_prompt(messages):
+    parts = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if role == "system":
+            parts.append(f"<|system|>\n{content}\n")
+        elif role == "assistant":
+            parts.append(f"<|assistant|>\n{content}\n")
+        else:
+            parts.append(f"<|user|>\n{content}\n")
+    parts.append("<|assistant|>\n")
+    return "".join(parts)
+
 def initialize_model_and_tokenizer():
     global global_model, global_tokenizer
     if global_model is None or global_tokenizer is None:
@@ -368,11 +382,14 @@ def stream_chat(
     for entry in history:
         messages.append(entry)
     messages.append({"role": "user", "content": message})
-    prompt = global_tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+    if getattr(global_tokenizer, "chat_template", None):
+        prompt = global_tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+    else:
+        prompt = _build_fallback_chat_prompt(messages)
     stop_event = threading.Event()
     class StopOnEvent(StoppingCriteria):
         def __init__(self, stop_event):
