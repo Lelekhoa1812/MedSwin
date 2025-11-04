@@ -5,6 +5,8 @@ import logging
 import torch
 import threading
 import time
+import re, unicodedata
+
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -129,24 +131,49 @@ global_model = None
 global_tokenizer = None
 global_file_info = {}
 
+def _normalize_text(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\u00A0", " ")  # NBSP -> space
+    # collapse runs of punctuation/brackets
+    s = re.sub(r"[\[\]\{\}\(\)<>/*_+=\-]{3,}", " ", s)
+    # drop lines with too much punctuation (likely headers, tables)
+    keep = []
+    for line in s.splitlines():
+        letters = sum(ch.isalnum() for ch in line)
+        punct   = sum(ch in r"[]{}()<>/*_+=\-|~`^" for ch in line)
+        if letters == 0 and punct > 0:
+            continue
+        if letters and punct / max(1, letters) > 1.5:
+            continue
+        keep.append(line)
+    s = "\n".join(keep)
+    # squeeze spaces
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+def _truncate_by_tokens(text: str, tokenizer, max_tokens: int = 1800) -> str:
+    ids = tokenizer(text, add_special_tokens=False, return_attention_mask=False)["input_ids"]
+    if len(ids) <= max_tokens:
+        return text
+    return tokenizer.decode(ids[-max_tokens:], skip_special_tokens=True)
+
+
 def _build_fallback_chat_prompt(messages):
-    """Fallback for models without a native chat template."""
-    sys_txt = ""
-    user_txt = ""
-    # merge system + previous assistant turns into system preamble
+    # Simple, widely-tolerated format
+    parts = []
+    sys_lines = [m["content"] for m in messages if m.get("role") == "system"]
+    if sys_lines:
+        parts.append(f"System:\n{'\n'.join(sys_lines)}\n")
     for m in messages:
         role = m.get("role", "user")
-        content = (m.get("content") or "").strip()
-        if role == "system":
-            sys_txt += content + "\n"
-    # the last user content is the actual instruction
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            user_txt = (m.get("content") or "").strip()
-            break
-    # Alpaca/Vicuna style
-    sys_block = f"<<SYS>>\n{sys_txt}\n<</SYS>>" if sys_txt else ""
-    return f"[INST] {sys_block}\n{user_txt} [/INST]"
+        if role == "user":
+            parts.append(f"User:\n{m.get('content','').strip()}\n")
+        elif role == "assistant":
+            parts.append(f"Assistant:\n{m.get('content','').strip()}\n")
+    parts.append("Assistant:\n")  # generation cue
+    return "\n".join(parts)
+
 
 
 def initialize_model_and_tokenizer():
@@ -422,6 +449,9 @@ def stream_chat(
             merged_file_sources[file_name] += 1
     logger.info(f"Merged retrieval file distribution: {merged_file_sources}")
     context = "\n\n".join([n.node.text for n in merged_nodes])
+    context = _normalize_text(context)
+    context = _truncate_by_tokens(context, global_tokenizer, max_tokens=1800)
+
     source_info = ""
     if merged_file_sources:
         source_info = "\n\nRetrieved information from files: " + ", ".join(merged_file_sources.keys())
@@ -458,7 +488,8 @@ def stream_chat(
     # Enforce a minimum generation length to avoid early stop at first token
     min_tokens = max(20, min(128, int(max_new_tokens // 8)))
 
-    STABLE_GREEDY = True  # <-- set True for clinical answers
+    STABLE_GREEDY = True  # set True for clinical answers
+    DETERMINISTIC = True  # Choose a stable default mode for clinical answers
 
     generation_kwargs = dict(
         inputs,
@@ -494,7 +525,34 @@ def stream_chat(
                 repetition_penalty=float(penalty),  # make sure UI default >= 1.1
             )
         )
-        
+
+    if DETERMINISTIC:
+        generation_kwargs.update(
+            do_sample=False,
+            temperature=0.0,          # ignored when do_sample=False
+            repetition_penalty=1.2,   # >= 1.1
+        )
+    else:
+        generation_kwargs.update(
+            do_sample=True,
+            temperature=float(temperature),   # e.g. 0.2–0.5 safer
+            top_p=float(top_p),               # e.g. 0.8–0.95
+            top_k=int(top_k),                 # e.g. 20–50
+            repetition_penalty=max(1.1, float(penalty)),
+        )
+
+    # Debugs
+    logger.info(f"do_sample={generation_kwargs.get('do_sample')} "
+            f"temp={generation_kwargs.get('temperature')} "
+            f"top_p={generation_kwargs.get('top_p')} "
+            f"top_k={generation_kwargs.get('top_k')} "
+            f"rep_pen={generation_kwargs.get('repetition_penalty')} "
+            f"no_repeat={generation_kwargs.get('no_repeat_ngram_size')}")
+
+    logger.info(f"context_chars={len(context)}")
+    logger.info(f"first_200_prompt_chars={prompt[:200].replace('\\n',' ')}")
+
+
     thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
     thread.start()
     updated_history = history + [
