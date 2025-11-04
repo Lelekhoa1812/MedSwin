@@ -152,14 +152,16 @@ def initialize_model_and_tokenizer():
         except ValueError as e:
             logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
             global_tokenizer = AutoTokenizer.from_pretrained(MODEL, token=HF_TOKEN, use_fast=False)
-        
-        # Ensure PAD exists
-        if global_tokenizer.pad_token_id is None:
+
+        # Ensure EOS/PAD exist
+        if global_tokenizer.eos_token_id is None and getattr(global_tokenizer, "eos_token", None) is None:
+            global_tokenizer.eos_token = "</s>"
+        if global_tokenizer.pad_token_id is None and getattr(global_tokenizer, "pad_token", None) is None:
             if global_tokenizer.eos_token is not None:
                 global_tokenizer.pad_token = global_tokenizer.eos_token
-                global_tokenizer.pad_token_id = global_tokenizer.eos_token_id
             else:
                 global_tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+        global_tokenizer.padding_side = "right"
             
         # Pick a safe dtype
         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
@@ -193,7 +195,10 @@ def initialize_model_and_tokenizer():
 
         # If we added a PAD token, adjust embeddings
         if hasattr(global_model, "resize_token_embeddings"):
-            global_model.resize_token_embeddings(len(global_tokenizer))
+            try:
+                global_model.resize_token_embeddings(len(global_tokenizer))
+            except Exception:
+                pass
 
         logger.info("Model and tokenizer initialized successfully")
 
@@ -455,6 +460,8 @@ def stream_chat(
         top_p=top_p,
         top_k=top_k,
         repetition_penalty=penalty,
+        no_repeat_ngram_size=3,
+        typical_p=0.95,
         do_sample=True,
         use_cache=True,
         stopping_criteria=stopping_criteria
@@ -573,7 +580,7 @@ def create_demo():
                             minimum=0.0,
                             maximum=1.0,
                             step=0.1,
-                            value=0.95, 
+                            value=0.9, 
                             label="Top P"
                         )
                         top_k = gr.Slider(
@@ -587,7 +594,7 @@ def create_demo():
                             minimum=0.0,
                             maximum=2.0,
                             step=0.1,
-                            value=0.8,
+                            value=1.15,
                             label="Repetition Penalty"
                         )
                         
