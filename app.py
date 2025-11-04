@@ -183,6 +183,29 @@ def _strip_disclaimers(text: str) -> str:
     return t.strip()
 
 
+LEADING_FILLER = [
+    r"^as an? [^,.:;]{0,80}[:,]?$",
+    r"^note:\s*",
+    r"^as a small amount.*$",
+    r"^the user (is|has|was) .*?$",
+]
+
+def _clean_leading_filler(text: str) -> str:
+    lines = [l.strip() for l in (text or "").splitlines()]
+    i = 0
+    while i < len(lines) and i < 2:  # only trim at most first two lines
+        line = lines[0]
+        if any(re.match(p, line, flags=re.I) for p in LEADING_FILLER):
+            lines.pop(0)
+        else:
+            break
+        i += 1
+    cleaned = "\n".join(lines).strip()
+    # soften third-person phrasing at the start
+    cleaned = re.sub(r"\b[Tt]he user\b", "you", cleaned, count=2)
+    return cleaned
+
+
 def _build_fallback_chat_prompt(messages):
     # Alpaca-style fallback prompt that works well with MedAlpaca/Gemma-derived SFTs
     # We collapse system + last user turn into an Instruction, keep brief history inline
@@ -285,6 +308,9 @@ def _load_model_and_tokenizer(model_name: str):
             tok.pad_token = tok.eos_token
         else:
             tok.add_special_tokens({"pad_token": "<|pad|>"})
+    if tok.bos_token_id is None and getattr(tok, "bos_token", None) is None:
+        # set a reasonable BOS to stabilize some chat models
+        tok.bos_token = tok.eos_token or tok.pad_token or "<s>"
     tok.padding_side = "right"
 
     mdl = AutoModelForCausalLM.from_pretrained(
@@ -292,7 +318,7 @@ def _load_model_and_tokenizer(model_name: str):
         device_map="auto",
         trust_remote_code=True,
         token=HF_TOKEN,
-        torch_dtype=dtype,
+        dtype=dtype,
         low_cpu_mem_usage=True,
     )
 
@@ -520,43 +546,43 @@ def stream_chat(
                 yield history + [{"role": "assistant", "content": "Please upload documents first or enable 'Disable document retrieval' to chat without documents."}]
                 return
 
-            embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
-            Settings.embed_model = embed_model
+        embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
+        Settings.embed_model = embed_model
 
-            storage_context = StorageContext.from_defaults(persist_dir=index_dir)
-            index = load_index_from_storage(storage_context, settings=Settings)
+        storage_context = StorageContext.from_defaults(persist_dir=index_dir)
+        index = load_index_from_storage(storage_context, settings=Settings)
 
-            base_retriever = index.as_retriever(similarity_top_k=retriever_k)
-            auto_merging_retriever = AutoMergingRetriever(
-                base_retriever,
-                storage_context=storage_context,
-                simple_ratio_thresh=merge_threshold,
-                verbose=True
-            )
+        base_retriever = index.as_retriever(similarity_top_k=retriever_k)
+        auto_merging_retriever = AutoMergingRetriever(
+            base_retriever,
+            storage_context=storage_context,
+            simple_ratio_thresh=merge_threshold, 
+            verbose=True
+        )
 
-            logger.info(f"[query] {message}")
-            t0 = time.time()
-            base_nodes = base_retriever.retrieve(message)
-            logger.info(f"[retrieval] base={len(base_nodes)} in {time.time()-t0:.2f}s")
+        logger.info(f"[query] {message}")
+        t0 = time.time()
+        base_nodes = base_retriever.retrieve(message)
+        logger.info(f"[retrieval] base={len(base_nodes)} in {time.time()-t0:.2f}s")
 
-            t1 = time.time()
-            merged_nodes = auto_merging_retriever.retrieve(message)
-            logger.info(f"[retrieval] merged={len(merged_nodes)} in {time.time()-t1:.2f}s")
+        t1 = time.time()
+        merged_nodes = auto_merging_retriever.retrieve(message)
+        logger.info(f"[retrieval] merged={len(merged_nodes)} in {time.time()-t1:.2f}s")
 
-            # merge text + normalize + truncate by tokens to keep headroom for generation
-            context = "\n\n".join([(n.node.text or "") for n in merged_nodes])
-            context = _normalize_text(context)
-            context = _truncate_by_tokens(context, global_tokenizer, max_tokens=1800)
+        # merge text + normalize + truncate by tokens to keep headroom for generation
+        context = "\n\n".join([(n.node.text or "") for n in merged_nodes])
+        context = _normalize_text(context)
+        context = _truncate_by_tokens(context, global_tokenizer, max_tokens=1800)
 
-            # compact source list
-            srcs = []
-            for n in merged_nodes:
-                md = getattr(n.node, "metadata", {}) or {}
-                fn = md.get("file_name")
-                if fn and fn not in srcs:
-                    srcs.append(fn)
-            if srcs:
-                source_info = "\n\n[Sources] " + ", ".join(srcs)
+        # compact source list
+        srcs = []
+        for n in merged_nodes:
+            md = getattr(n.node, "metadata", {}) or {}
+            fn = md.get("file_name")
+            if fn and fn not in srcs:
+                srcs.append(fn)
+        if srcs:
+            source_info = "\n\n[Sources] " + ", ".join(srcs)
     except Exception as e:
         logger.exception(f"retrieval error: {e}")
         # fallback to no context rather than failing the chat
@@ -624,6 +650,8 @@ def stream_chat(
         use_cache=True,
         stopping_criteria=stopping_criteria,
         bad_words_ids=bad_words_ids,
+        eos_token_id=global_tokenizer.eos_token_id,
+        pad_token_id=global_tokenizer.pad_token_id or global_tokenizer.eos_token_id,
     )
     if use_sampling:
         generation_kwargs.update(
@@ -660,8 +688,8 @@ def stream_chat(
             updated_history[-1]["content"] = partial_response
             yield updated_history
 
-        # Final tidy-up before returning
-        final_text = _strip_disclaimers(_normalize_text(partial_response))
+        # Minimal postprocessing: trim whitespace only
+        final_text = (partial_response or "").strip()
         updated_history[-1]["content"] = final_text
         yield updated_history
 
@@ -756,7 +784,7 @@ def create_demo():
                             minimum=0,
                             maximum=1,
                             step=0.1,
-                            value=0.5,  
+                            value=0.2,  
                             label="Temperature"
                         )
                         max_new_tokens = gr.Slider(
