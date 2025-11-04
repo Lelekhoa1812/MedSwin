@@ -412,31 +412,19 @@ def stream_chat(
         skip_special_tokens=True
     )
     inputs = global_tokenizer(prompt, return_tensors="pt").to(global_model.device)
-    # Ensure proper termination tokens are set for generation
-    eos_candidates = set()
-    if isinstance(getattr(global_tokenizer, "eos_token_id", None), int):
-        eos_candidates.add(global_tokenizer.eos_token_id)
-    for tok in ("<|eot_id|>", "<|end_of_text|>", "<eos>"):
-        try:
-            tid = global_tokenizer.convert_tokens_to_ids(tok)
-            if isinstance(tid, int) and tid != global_tokenizer.unk_token_id and tid != -1:
-                eos_candidates.add(tid)
-        except Exception:
-            pass
-    eos_id = list(eos_candidates) if eos_candidates else None
-    pad_id = global_tokenizer.pad_token_id or (global_tokenizer.eos_token_id if isinstance(global_tokenizer.eos_token_id, int) else None)
+    # Enforce a minimum generation length to avoid early stop at first token
+    min_tokens = max(20, min(312, int(max_new_tokens // 8)))
     generation_kwargs = dict(
         inputs,
         streamer=streamer,
         max_new_tokens=max_new_tokens,
+        min_new_tokens=min_tokens,
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
         repetition_penalty=penalty,
         do_sample=True,
         use_cache=True,
-        eos_token_id=eos_id,
-        pad_token_id=pad_id,
         stopping_criteria=stopping_criteria
     )
     thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
@@ -539,7 +527,7 @@ def create_demo():
                             minimum=0,
                             maximum=1,
                             step=0.1,
-                            value=0.9,  
+                            value=0.5,  
                             label="Temperature"
                         )
                         max_new_tokens = gr.Slider(
@@ -567,7 +555,7 @@ def create_demo():
                             minimum=0.0,
                             maximum=2.0,
                             step=0.1,
-                            value=1.2,
+                            value=0.8,
                             label="Repetition Penalty"
                         )
                         
