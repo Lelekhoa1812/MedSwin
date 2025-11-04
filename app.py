@@ -132,32 +132,52 @@ global_tokenizer = None
 global_file_info = {}
 
 
+import html
+
 def _normalize_text(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s)
-    s = s.replace("\u00A0", " ")  # NBSP -> space
-    # collapse runs of punctuation/brackets
+    s = unicodedata.normalize("NFKC", s or "")
+    s = html.unescape(s)                     # &nbsp; &amp; → real chars
+    s = s.replace("\u00A0", " ")             # NBSP → space
     s = re.sub(r"[\[\]\{\}\(\)<>/*_+=\-]{3,}", " ", s)
-    # drop lines with too much punctuation (likely headers, tables)
+
     keep = []
     for line in s.splitlines():
         letters = sum(ch.isalnum() for ch in line)
         punct   = sum(ch in r"[]{}()<>/*_+=\-|~`^" for ch in line)
-        if letters == 0 and punct > 0:
+        if letters == 0 and punct > 0:           # junk lines
             continue
         if letters and punct / max(1, letters) > 1.5:
             continue
         keep.append(line)
     s = "\n".join(keep)
-    # squeeze spaces
     s = re.sub(r"[ \t]{2,}", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
+
 
 def _truncate_by_tokens(text: str, tokenizer, max_tokens: int = 1800) -> str:
     ids = tokenizer(text, add_special_tokens=False, return_attention_mask=False)["input_ids"]
     if len(ids) <= max_tokens:
         return text
     return tokenizer.decode(ids[-max_tokens:], skip_special_tokens=True)
+
+
+DISCLAIMER_PATTERNS = [
+    r"\bnot (a|your) (doctor|physician)\b",
+    r"\bnot medical advice\b",
+    r"\bfor informational purposes only\b",
+    r"\balways consult (a|your) healthcare (professional|provider)\b",
+    r"\bas an ai\b",
+    r"\bi (cannot|can't) provide medical advice\b",
+]
+
+def _strip_disclaimers(text: str) -> str:
+    t = text
+    for pat in DISCLAIMER_PATTERNS:
+        t = re.sub(pat, "", t, flags=re.I)
+    # collapse leftover double spaces
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
 
 
 def _build_fallback_chat_prompt(messages):
@@ -558,7 +578,13 @@ def stream_chat(
     enc = global_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_inp).to(global_model.device)
 
     # discourage self-referential prefaces
-    BAD_PHRASES = ["As an AI", "language model", "I cannot provide medical advice"]
+    BAD_PHRASES = [
+        "As an AI", "language model", "I cannot provide medical advice",
+        "This is not medical advice", "for informational purposes only",
+        "consult a healthcare professional", "consult your doctor",
+        "I am not a doctor"
+    ]
+
     bad_words_ids = []
     for phrase in BAD_PHRASES:
         try:
@@ -624,7 +650,7 @@ def stream_chat(
         stop_event.set()
         updated_history[-1]["content"] = (partial_response or "") + "\n\n[Generation stopped due to an internal error.]"
         yield updated_history
-        
+
 
     def _watch_first_token():
         # If no tokens after timeout, trigger stop to avoid hangs
@@ -703,14 +729,15 @@ def create_demo():
                 with gr.Accordion("Advanced Settings", open=False):
                     system_prompt = gr.Textbox(
                         value=(
-                            "You are a cautious, evidence-focused medical assistant. Use only the provided document context to answer. "
-                            "When relevant, cite the source filenames succinctly. Summarize clinical evidence and guidelines, "
-                            "highlight uncertainties or contraindications, and avoid making definitive diagnoses. If the context "
-                            "is insufficient, state what is missing and suggest what additional information would be needed. "
-                            "Do not fabricate facts. This is not medical advice."
+                            "You are a cautious, evidence-focused medical assistant.\n"
+                            "- Use the provided document context when available; if missing or insufficient, say what is needed.\n"
+                            "- Answer directly in clinical language, concise (≤150 words).\n"
+                            "- Do NOT restate disclaimers, and do NOT mention that you are an AI.\n"
+                            "- Cite source filenames in brackets only if used (e.g., [guideline.pdf]).\n"
+                            "- Avoid meta-commentary and apologies."
                         ),
                         label="System Prompt",
-                        lines=3
+                        lines=4
                     )
                     gr.Markdown(
                         "**Clinical Use Disclaimer:** This application is intended for informational purposes only and does not constitute medical advice. "
