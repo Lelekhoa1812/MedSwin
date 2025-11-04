@@ -133,7 +133,11 @@ def initialize_model_and_tokenizer():
     global global_model, global_tokenizer
     if global_model is None or global_tokenizer is None:
         logger.info("Initializing model and tokenizer...")
-        global_tokenizer = AutoTokenizer.from_pretrained(MODEL, token=HF_TOKEN)
+        try:
+            global_tokenizer = AutoTokenizer.from_pretrained(MODEL, token=HF_TOKEN)
+        except ValueError as e:
+            logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
+            global_tokenizer = AutoTokenizer.from_pretrained(MODEL, token=HF_TOKEN, use_fast=False)
         global_model = AutoModelForCausalLM.from_pretrained(
             MODEL,
             device_map="auto",
