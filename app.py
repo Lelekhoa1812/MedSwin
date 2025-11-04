@@ -275,7 +275,7 @@ def initialize_model_and_tokenizer():
             device_map="auto",
             trust_remote_code=True,
             token=HF_TOKEN,
-            torch_dtype=dtype,
+            dtype=dtype,
             low_cpu_mem_usage=True,
         )
 
@@ -596,20 +596,27 @@ def stream_chat(
     if not bad_words_ids:
         bad_words_ids = None
 
+    # Honour temperature: sample iff temperature > 0
+    use_sampling = float(temperature) > 0.0
+    min_tokens = 16
+
     # deterministic clinical generation
     min_tokens = 16
+    
     generation_kwargs = dict(
         **enc,
         streamer=streamer,
-        max_new_tokens=max_new_tokens,
+        max_new_tokens=int(max_new_tokens),
         min_new_tokens=min_tokens,
-        do_sample=False,             # deterministic
-        temperature=0.0,             # ignored when do_sample=False
-        repetition_penalty=max(1.1, penalty),
+        do_sample=use_sampling,
+        temperature=float(temperature) if use_sampling else None,
+        top_p=float(top_p) if use_sampling else None,
+        top_k=int(top_k) if use_sampling else None,
+        repetition_penalty=max(1.1, float(penalty)),
         no_repeat_ngram_size=4,
         use_cache=True,
         stopping_criteria=stopping_criteria,
-        bad_words_ids=bad_words_ids
+        bad_words_ids=bad_words_ids,
     )
 
     logger.info(f"chat_template={'yes' if used_chat_template else 'no'}  ctx={ctx}  max_inp={max_inp}  max_new={max_new_tokens}")
@@ -639,8 +646,12 @@ def stream_chat(
             partial_response += chunk
             updated_history[-1]["content"] = partial_response
             yield updated_history
-        # done
+
+        # Final tidy-up before returning
+        final_text = _strip_disclaimers(_normalize_text(partial_response))
+        updated_history[-1]["content"] = final_text
         yield updated_history
+
     except GeneratorExit:
         stop_event.set()
         thread.join()
