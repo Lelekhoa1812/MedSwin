@@ -1,13 +1,15 @@
 ---
-title: RAG Llama
-emoji: 📖
-colorFrom: indigo
-colorTo: yellow
+title: MedSwin Distilled 7B
+emoji: 💬
+colorFrom: yellow
+colorTo: purple
 sdk: gradio
-sdk_version: 5.20.0
+sdk_version: 5.42.0
 app_file: app.py
 pinned: false
-short_description: RAG Chatbot with Llama3.1-8B for PDFs
+hf_oauth: true
+hf_oauth_scopes:
+- inference-api
+license: apache-2.0
+short_description: MedAlpaca-7B SFT & MedGemma-27b KD with RAG
 ---
-
-Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
