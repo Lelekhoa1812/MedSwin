@@ -681,7 +681,15 @@ def stream_chat(
         )
 
     logger.info(f"chat_template={'yes' if used_chat_template else 'no'}  ctx={ctx}  max_inp={max_inp}  max_new={max_new_tokens}")
-    logger.info(f"prompt_preview={(prompt[:200].replace(chr(10),' '))}")
+    logger.info(f"prompt_preview={(prompt[:300].replace(chr(10),' '))}")
+    logger.info(f"prompt_length={len(prompt)} chars")
+    
+    # Log first few tokens to verify tokenization
+    try:
+        test_tokens = global_tokenizer.encode(prompt[:100], add_special_tokens=False)
+        logger.info(f"first_10_tokens={test_tokens[:10]}")
+    except Exception as e:
+        logger.warning(f"Could not preview tokens: {e}")
     thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
     thread.start()
 
