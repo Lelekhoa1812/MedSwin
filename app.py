@@ -37,18 +37,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 hf_logging.set_verbosity_error()
 
-MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+MODEL = "MedAI-COS30018/MedSwin-7B-Distilled"
+EMBEDDING_MODEL = "abhinand/MedEmbed-large-v0.1"
 HF_TOKEN = os.environ.get("HF_TOKEN")
 if not HF_TOKEN:
     raise ValueError("HF_TOKEN not found in environment variables")
 
 # Custom UI
-TITLE = "<h1><center>Multi-Document RAG with LLama 3.1-8B Model</center></h1>"
+TITLE = "<h1><center>Medical RAG Assistant (MedSwin-7B Distilled)</center></h1>"
 DESCRIPTION = """
 <center>
-<p>Upload PDF or text files to get started!</p>
-<p>After asking question wait for RAG system to get relevant nodes and pass to LLM</p>
+<p>Upload clinical PDFs or text (guidelines, notes, literature) to build a medical context.</p>
+<p>This app retrieves relevant snippets and answers with our specialized medical LLM.</p>
+<p><b>Important:</b> This is an information tool, not a substitute for professional medical advice.</p>
 </center>
 """
 CSS = """
@@ -60,7 +61,7 @@ CSS = """
     border-radius: 10px;
 }
 .upload-button {
-    background: #34c759 !important;
+    background: #2e7d32 !important; /* medical green */
     color: white !important;
     border-radius: 25px !important;
 }
@@ -96,7 +97,7 @@ CSS = """
     font-size: 12px;
 }
 .submit-btn {
-    background: #1a73e8 !important;
+    background: #00796b !important; /* teal */
     color: white !important;
     border-radius: 25px !important;
     margin-left: 10px;
@@ -138,7 +139,7 @@ def initialize_model_and_tokenizer():
             device_map="auto",
             trust_remote_code=True,
             token=HF_TOKEN,
-            torch_dtype=torch.float16
+            torch_dtype=torch.bfloat16
         )
         logger.info("Model and tokenizer initialized successfully")
 
@@ -462,10 +463,19 @@ def create_demo():
                 
                 with gr.Accordion("Advanced Settings", open=False):
                     system_prompt = gr.Textbox(
-                        value="As a knowledgeable assistant, your task is to provide detailed and context-rich answers based on the relevant information from all uploaded documents. When information is sourced from multiple documents, summarize the key points from each and explain how they relate, noting any connections or contradictions. Your response should be thorough, informative, and easy to understand.",
+                        value=(
+                            "You are a cautious, evidence-focused medical assistant. Use only the provided document context to answer. "
+                            "When relevant, cite the source filenames succinctly. Summarize clinical evidence and guidelines, "
+                            "highlight uncertainties or contraindications, and avoid making definitive diagnoses. If the context "
+                            "is insufficient, state what is missing and suggest what additional information would be needed. "
+                            "Do not fabricate facts. This is not medical advice."
+                        ),
                         label="System Prompt",
                         lines=3
                     )
+                    gr.Markdown(
+                        "**Clinical Use Disclaimer:** This application is intended for informational purposes only and does not constitute medical advice. "
+                        "Always consult qualified healthcare professionals for diagnosis and treatment decisions.")
                     
                     with gr.Tab("Generation Parameters"):
                         temperature = gr.Slider(
