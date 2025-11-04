@@ -181,28 +181,37 @@ def _strip_disclaimers(text: str) -> str:
 
 
 def _build_fallback_chat_prompt(messages):
-    # Messages: list of {"role": system|user|assistant, "content": str}
-    # Build a simple Q/A transcript without the tokens "User:"/"Assistant:"
-    sys_blocks = [m.get("content","").strip() for m in messages if m.get("role") == "system"]
+    # Alpaca-style fallback prompt that works well with MedAlpaca/Gemma-derived SFTs
+    # We collapse system + last user turn into an Instruction, keep brief history inline
+    sys_blocks = [m.get("content", "").strip() for m in messages if m.get("role") == "system"]
     sys_text = "\n".join([b for b in sys_blocks if b])
+    user_turns = [m.get("content", "").strip() for m in messages if m.get("role") == "user"]
+    last_user = user_turns[-1] if user_turns else ""
 
-    convo = []
+    history_pairs = []
+    current_q = None
     for m in messages:
         role = m.get("role")
-        content = (m.get("content","") or "").strip()
-        if not content:
-            continue
+        content = (m.get("content", "") or "").strip()
         if role == "user":
-            convo.append(f"Q: {content}")
-        elif role == "assistant":
-            convo.append(f"A: {content}")
+            current_q = content
+        elif role == "assistant" and current_q:
+            history_pairs.append((current_q, content))
+            current_q = None
+
+    history_text = "\n".join([f"Q: {q}\nA: {a}" for q, a in history_pairs[-2:]])  # keep last 2 QA pairs
+
+    instruction = sys_text
+    if history_text:
+        instruction += f"\n\nContext Conversation (for background):\n{history_text}"
+    if last_user:
+        instruction += f"\n\nTask: Answer the user's question.\nQuestion: {last_user}"
 
     return (
-        "### System\n"
-        f"{sys_text}\n\n"
-        "### Conversation\n"
-        + "\n".join(convo) +
-        "\nA: "  # generation cue; we strip the leading 'A:' after generation
+        "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n"
+        f"{instruction}\n\n"
+        "### Response:\n"
     )
 
 
@@ -586,24 +595,8 @@ def stream_chat(
     max_inp = max(256, ctx - int(max_new_tokens) - 8)
     enc = global_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_inp).to(global_model.device)
 
-    # discourage self-referential prefaces
-    BAD_PHRASES = [
-        "As an AI", "language model", "I cannot provide medical advice",
-        "This is not medical advice", "for informational purposes only",
-        "consult a healthcare professional", "consult your doctor",
-        "I am not a doctor"
-    ]
-
-    bad_words_ids = []
-    for phrase in BAD_PHRASES:
-        try:
-            ids = global_tokenizer(phrase, add_special_tokens=False)["input_ids"]
-            if ids:
-                bad_words_ids.append(ids)
-        except Exception:
-            pass
-    if not bad_words_ids:
-        bad_words_ids = None
+    # avoid aggressive bad-words filtering which can distort outputs
+    bad_words_ids = None
 
     # Honour temperature: sample iff temperature > 0
     use_sampling = float(temperature) > 0.0
@@ -618,15 +611,18 @@ def stream_chat(
         max_new_tokens=int(max_new_tokens),
         min_new_tokens=min_tokens,
         do_sample=use_sampling,
-        temperature=float(temperature) if use_sampling else None,
-        top_p=float(top_p) if use_sampling else None,
-        top_k=int(top_k) if use_sampling else None,
         repetition_penalty=max(1.1, float(penalty)),
         no_repeat_ngram_size=4,
         use_cache=True,
         stopping_criteria=stopping_criteria,
         bad_words_ids=bad_words_ids,
     )
+    if use_sampling:
+        generation_kwargs.update(
+            temperature=float(temperature),
+            top_p=float(top_p),
+            top_k=int(top_k),
+        )
 
     logger.info(f"chat_template={'yes' if used_chat_template else 'no'}  ctx={ctx}  max_inp={max_inp}  max_new={max_new_tokens}")
     logger.info(f"prompt_preview={(prompt[:200].replace(chr(10),' '))}")
@@ -672,28 +668,7 @@ def stream_chat(
         yield updated_history
 
 
-    def _watch_first_token():
-        # If no tokens after timeout, trigger stop to avoid hangs
-        if not first_token_received.wait(timeout=45):
-            logger.warning("Generation timeout: no tokens received in 45s; stopping stream.")
-            stop_event.set()
-
-    watchdog = threading.Thread(target=_watch_first_token, daemon=True)
-    watchdog.start()
-    try:
-        for new_text in streamer:
-            if new_text and not first_token_received.is_set():
-                first_token_received.set()
-            partial_response += new_text
-            updated_history[-1]["content"] = partial_response
-            yield updated_history
-        output_ids = global_tokenizer.encode(partial_response, return_tensors="pt")
-        logger.info(f"Stream finished. Generated tokens: {output_ids.shape[-1] if hasattr(output_ids, 'shape') else 'n/a'}")
-        yield updated_history
-    except GeneratorExit:
-        stop_event.set()
-        thread.join()
-        raise
+    # remove duplicated second streaming loop
 
 
 def create_demo():
