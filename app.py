@@ -130,18 +130,24 @@ global_tokenizer = None
 global_file_info = {}
 
 def _build_fallback_chat_prompt(messages):
-    parts = []
+    """Fallback for models without a native chat template."""
+    sys_txt = ""
+    user_txt = ""
+    # merge system + previous assistant turns into system preamble
     for m in messages:
         role = m.get("role", "user")
-        content = m.get("content", "")
+        content = (m.get("content") or "").strip()
         if role == "system":
-            parts.append(f"<|system|>\n{content}\n")
-        elif role == "assistant":
-            parts.append(f"<|assistant|>\n{content}\n")
-        else:
-            parts.append(f"<|user|>\n{content}\n")
-    parts.append("<|assistant|>\n")
-    return "".join(parts)
+            sys_txt += content + "\n"
+    # the last user content is the actual instruction
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            user_txt = (m.get("content") or "").strip()
+            break
+    # Alpaca/Vicuna style
+    sys_block = f"<<SYS>>\n{sys_txt}\n<</SYS>>" if sys_txt else ""
+    return f"[INST] {sys_block}\n{user_txt} [/INST]"
+
 
 def initialize_model_and_tokenizer():
     global global_model, global_tokenizer
@@ -451,6 +457,9 @@ def stream_chat(
     inputs = global_tokenizer(prompt, return_tensors="pt").to(global_model.device)
     # Enforce a minimum generation length to avoid early stop at first token
     min_tokens = max(20, min(128, int(max_new_tokens // 8)))
+
+    STABLE_GREEDY = True  # <-- set True for clinical answers
+
     generation_kwargs = dict(
         inputs,
         streamer=streamer,
@@ -466,6 +475,26 @@ def stream_chat(
         use_cache=True,
         stopping_criteria=stopping_criteria
     )
+
+    if STABLE_GREEDY:
+        generation_kwargs.update(
+            dict(
+                do_sample=False,           # deterministic
+                temperature=0.0,           # ignored when do_sample=False
+                repetition_penalty=1.2,
+            )
+        )
+    else:
+        generation_kwargs.update(
+            dict(
+                do_sample=True,
+                temperature=float(temperature),
+                top_p=float(top_p),
+                top_k=int(top_k),
+                repetition_penalty=float(penalty),  # make sure UI default >= 1.1
+            )
+        )
+        
     thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
     thread.start()
     updated_history = history + [
