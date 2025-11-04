@@ -164,7 +164,8 @@ def _build_fallback_chat_prompt(messages):
     parts = []
     sys_lines = [m["content"] for m in messages if m.get("role") == "system"]
     if sys_lines:
-        parts.append(f"System:\n{'\n'.join(sys_lines)}\n")
+        sys_block = "\n".join(sys_lines)
+        parts.append("System:\n" + sys_block + "\n")
     for m in messages:
         role = m.get("role", "user")
         if role == "user":
@@ -550,7 +551,8 @@ def stream_chat(
             f"no_repeat={generation_kwargs.get('no_repeat_ngram_size')}")
 
     logger.info(f"context_chars={len(context)}")
-    logger.info(f"first_200_prompt_chars={prompt[:200].replace('\\n',' ')}")
+    _preview = prompt[:200].replace("\n", " ")
+    logger.info(f"first_200_prompt_chars={_preview}")
 
 
     thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
