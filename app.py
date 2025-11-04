@@ -177,7 +177,7 @@ def initialize_model_and_tokenizer():
             device_map="auto",
             trust_remote_code=True,
             token=HF_TOKEN,
-            dtype=dtype,                  # <-- use dtype (not torch_dtype)
+            torch_dtype=dtype,
             low_cpu_mem_usage=True,
         )
 
@@ -420,9 +420,12 @@ def stream_chat(
         messages.append(entry)
     messages.append({"role": "user", "content": message})
     if hasattr(global_tokenizer, "apply_chat_template"):
-        prompt = global_tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        try:
+            prompt = global_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except ValueError:
+            prompt = _build_fallback_chat_prompt(messages)
     else:
         prompt = _build_fallback_chat_prompt(messages)
 
