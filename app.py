@@ -203,7 +203,7 @@ def initialize_model_and_tokenizer():
         elif torch.cuda.is_available():
             dtype = torch.float16
         elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            dtype = torch.float16
+            dtype = torch.float32
         else:
             dtype = torch.float32
         logger.info(f"Using dtype: {dtype}")
@@ -237,7 +237,7 @@ def initialize_model_and_tokenizer():
         logger.info("Model and tokenizer initialized successfully")
 
 
-def get_llm(temperature=0.7, max_new_tokens=256, top_p=0.95, top_k=50):
+def get_llm(temperature=0.0, max_new_tokens=256, top_p=0.95, top_k=50):
     global global_model, global_tokenizer
     if global_model is None or global_tokenizer is None:
         initialize_model_and_tokenizer()
@@ -248,8 +248,10 @@ def get_llm(temperature=0.7, max_new_tokens=256, top_p=0.95, top_k=50):
         tokenizer=global_tokenizer,
         model=global_model,
         generate_kwargs={
-            "do_sample": True,
+            "do_sample": False,
             "temperature": temperature,
+            "repetition_penalty": 1.2,
+            "no_repeat_ngram_size": 4,
             "top_k": top_k,
             "top_p": top_p
         }
@@ -388,6 +390,7 @@ def stream_chat(
     message: str,
     history: list,
     system_prompt: str,
+    disable_retrieval: bool,
     temperature: float,
     max_new_tokens: int,
     top_p: float,
@@ -402,9 +405,6 @@ def stream_chat(
         return
     user_id = request.session_hash
     index_dir = f"./{user_id}_index"
-    if not os.path.exists(index_dir):
-        yield history + [{"role": "assistant", "content": "Please upload documents first."}]
-        return
 
     max_new_tokens = int(max_new_tokens) if isinstance(max_new_tokens, (int, float)) else 1024
     temperature = float(temperature) if isinstance(temperature, (int, float)) else 0.9  
@@ -414,49 +414,55 @@ def stream_chat(
     retriever_k = int(retriever_k) if isinstance(retriever_k, (int, float)) else 15
     merge_threshold = float(merge_threshold) if isinstance(merge_threshold, (int, float)) else 0.5
     llm = get_llm(temperature=temperature, max_new_tokens=max_new_tokens, top_p=top_p, top_k=top_k)
-    embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
     Settings.llm = llm
-    Settings.embed_model = embed_model
-    storage_context = StorageContext.from_defaults(persist_dir=index_dir)
-    index = load_index_from_storage(storage_context, settings=Settings)
-    base_retriever = index.as_retriever(similarity_top_k=retriever_k)
-    auto_merging_retriever = AutoMergingRetriever(
-        base_retriever,
-        storage_context=storage_context,
-        simple_ratio_thresh=merge_threshold, 
-        verbose=True
-    )
-    logger.info(f"Query: {message}")
-    retrieval_start = time.time()
-    base_nodes = base_retriever.retrieve(message)
-    logger.info(f"Retrieved {len(base_nodes)} base nodes in {time.time() - retrieval_start:.2f}s")
-    base_file_sources = {}
-    for node in base_nodes:
-        if hasattr(node.node, 'metadata') and 'file_name' in node.node.metadata:
-            file_name = node.node.metadata['file_name']
-            if file_name not in base_file_sources:
-                base_file_sources[file_name] = 0
-            base_file_sources[file_name] += 1
-    logger.info(f"Base retrieval file distribution: {base_file_sources}")
-    merging_start = time.time()
-    merged_nodes = auto_merging_retriever.retrieve(message)
-    logger.info(f"Retrieved {len(merged_nodes)} merged nodes in {time.time() - merging_start:.2f}s")
-    merged_file_sources = {}
-    for node in merged_nodes:
-        if hasattr(node.node, 'metadata') and 'file_name' in node.node.metadata:
-            file_name = node.node.metadata['file_name']
-            if file_name not in merged_file_sources:
-                merged_file_sources[file_name] = 0
-            merged_file_sources[file_name] += 1
-    logger.info(f"Merged retrieval file distribution: {merged_file_sources}")
-    context = "\n\n".join([n.node.text for n in merged_nodes])
-    context = _normalize_text(context)
-    context = _truncate_by_tokens(context, global_tokenizer, max_tokens=1800)
-
+    context = ""
     source_info = ""
-    if merged_file_sources:
-        source_info = "\n\nRetrieved information from files: " + ", ".join(merged_file_sources.keys())
-    formatted_system_prompt = f"{system_prompt}\n\nDocument Context:\n{context}{source_info}"
+    if not disable_retrieval:
+        if not os.path.exists(index_dir):
+            yield history + [{"role": "assistant", "content": "Please upload documents first or enable 'Disable document retrieval' to chat without documents."}]
+            return
+        embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
+        Settings.embed_model = embed_model
+        storage_context = StorageContext.from_defaults(persist_dir=index_dir)
+        index = load_index_from_storage(storage_context, settings=Settings)
+        base_retriever = index.as_retriever(similarity_top_k=retriever_k)
+        auto_merging_retriever = AutoMergingRetriever(
+            base_retriever,
+            storage_context=storage_context,
+            simple_ratio_thresh=merge_threshold, 
+            verbose=True
+        )
+        logger.info(f"Query: {message}")
+        retrieval_start = time.time()
+        base_nodes = base_retriever.retrieve(message)
+        logger.info(f"Retrieved {len(base_nodes)} base nodes in {time.time() - retrieval_start:.2f}s")
+        base_file_sources = {}
+        for node in base_nodes:
+            if hasattr(node.node, 'metadata') and 'file_name' in node.node.metadata:
+                file_name = node.node.metadata['file_name']
+                if file_name not in base_file_sources:
+                    base_file_sources[file_name] = 0
+                base_file_sources[file_name] += 1
+        logger.info(f"Base retrieval file distribution: {base_file_sources}")
+        merging_start = time.time()
+        merged_nodes = auto_merging_retriever.retrieve(message)
+        logger.info(f"Retrieved {len(merged_nodes)} merged nodes in {time.time() - merging_start:.2f}s")
+        merged_file_sources = {}
+        for node in merged_nodes:
+            if hasattr(node.node, 'metadata') and 'file_name' in node.node.metadata:
+                file_name = node.node.metadata['file_name']
+                if file_name not in merged_file_sources:
+                    merged_file_sources[file_name] = 0
+                merged_file_sources[file_name] += 1
+        logger.info(f"Merged retrieval file distribution: {merged_file_sources}")
+        context = "\n\n".join([n.node.text for n in merged_nodes])
+        context = _normalize_text(context)
+        context = _truncate_by_tokens(context, global_tokenizer, max_tokens=1800)
+        if merged_file_sources:
+            source_info = "\n\nRetrieved information from files: " + ", ".join(merged_file_sources.keys())
+    formatted_system_prompt = (
+        f"{system_prompt}\n\n" + ("Document Context:\n" + context + source_info if context else "")
+    )
     messages = [{"role": "system", "content": formatted_system_prompt}]
     for entry in history:
         messages.append(entry)
@@ -487,7 +493,7 @@ def stream_chat(
     )
     inputs = global_tokenizer(prompt, return_tensors="pt").to(global_model.device)
     # Enforce a minimum generation length to avoid early stop at first token
-    min_tokens = max(20, min(128, int(max_new_tokens // 8)))
+    min_tokens = 16 # max(20, min(128, int(max_new_tokens // 8))) #dynamic
 
     STABLE_GREEDY = True  # set True for clinical answers
     DETERMINISTIC = True  # Choose a stable default mode for clinical answers
@@ -624,6 +630,10 @@ def create_demo():
                     show_label=False,
                     type="messages"
                 )
+                disable_retrieval = gr.Checkbox(
+                    label="Disable document retrieval (use model ground knowledge)",
+                    value=False
+                )
                 with gr.Row(elem_classes="input-row"):
                     message_input = gr.Textbox(
                         placeholder="Type your question here...",
@@ -709,6 +719,7 @@ def create_demo():
                         message_input, 
                         chatbot, 
                         system_prompt, 
+                        disable_retrieval,
                         temperature, 
                         max_new_tokens, 
                         top_p, 
@@ -726,6 +737,7 @@ def create_demo():
                         message_input, 
                         chatbot, 
                         system_prompt, 
+                        disable_retrieval,
                         temperature, 
                         max_new_tokens, 
                         top_p, 
