@@ -42,6 +42,7 @@ hf_logging.set_verbosity_error()
 MEDSWIN_KD_MODEL = "MedAI-COS30018/MedSwin-7B-KD"
 MEDSWIN_SFT_MODEL = "MedAI-COS30018/MedSwin-7B-SFT"
 MEDALPACA_MODEL = "medalpaca/medalpaca-7b"
+MEDGEMMA_MODEL = "google/medgemma-27b-text-it"
 MODEL = MEDSWIN_KD_MODEL
 EMBEDDING_MODEL = "abhinand/MedEmbed-large-v0.1"
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -774,7 +775,7 @@ def create_demo():
                     type="messages"
                 )
                 model_selector = gr.Radio(
-                    choices=["MedSwin-7B KD", "MedSwin-7B SFT", "MedAlpaca-7B"],
+                    choices=["MedSwin-7B KD", "MedSwin-7B SFT", "MedAlpaca-7B", "MedGemma-27B"],
                     value="MedSwin-7B KD",
                     label="Model"
                 )
@@ -859,7 +860,14 @@ def create_demo():
                         )
 
                 def _on_model_change(choice):
-                    name = MEDSWIN_KD_MODEL if choice == "MedSwin-7B KD" else MEDALPACA_MODEL
+                    if choice == "MedSwin-7B KD":
+                        name = MEDSWIN_KD_MODEL
+                    elif choice == "MedSwin-7B SFT":
+                        name = MEDSWIN_SFT_MODEL
+                    elif choice == "MedAlpaca-7B":
+                        name = MEDALPACA_MODEL
+                    else:  # MedGemma-27B
+                        name = MEDGEMMA_MODEL
                     initialize_model_and_tokenizer(name)
                     return f"Loaded: {choice}"
 
