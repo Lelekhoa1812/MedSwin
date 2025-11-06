@@ -39,16 +39,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 hf_logging.set_verbosity_error()
 
-MEDSWIN_MODEL = "MedAI-COS30018/MedSwin-7B-Distilled"
+MEDSWIN_KD_MODEL = "MedAI-COS30018/MedSwin-7B-KD"
+MEDSWIN_SFT_MODEL = "MedAI-COS30018/MedSwin-7B-SFT"
 MEDALPACA_MODEL = "medalpaca/medalpaca-7b"
-MODEL = MEDSWIN_MODEL
+MODEL = MEDSWIN_KD_MODEL
 EMBEDDING_MODEL = "abhinand/MedEmbed-large-v0.1"
 HF_TOKEN = os.environ.get("HF_TOKEN")
 if not HF_TOKEN:
     raise ValueError("HF_TOKEN not found in environment variables")
 
 # Custom UI
-TITLE = "<h1><center>Medical RAG Assistant (MedSwin-7B Distilled)</center></h1>"
+TITLE = "<h1><center>Medical RAG Assistant (MedSwin-7B variants)</center></h1>"
 DESCRIPTION = """
 <center>
 <p>Upload clinical PDFs or text (guidelines, notes, literature) to build a medical context.</p>
@@ -773,8 +774,8 @@ def create_demo():
                     type="messages"
                 )
                 model_selector = gr.Radio(
-                    choices=["MedSwin-7B Distilled", "MedAlpaca-7B"],
-                    value="MedSwin-7B Distilled",
+                    choices=["MedSwin-7B KD", "MedSwin-7B SFT", "MedAlpaca-7B"],
+                    value="MedSwin-7B KD",
                     label="Model"
                 )
                 disable_retrieval = gr.Checkbox(
@@ -858,7 +859,7 @@ def create_demo():
                         )
 
                 def _on_model_change(choice):
-                    name = MEDSWIN_MODEL if choice == "MedSwin-7B Distilled" else MEDALPACA_MODEL
+                    name = MEDSWIN_KD_MODEL if choice == "MedSwin-7B KD" else MEDALPACA_MODEL
                     initialize_model_and_tokenizer(name)
                     return f"Loaded: {choice}"
 
