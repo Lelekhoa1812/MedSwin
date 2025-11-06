@@ -12,12 +12,12 @@ pip install gradio_client
 
 ```python
 from gradio_client import Client, handle_file
-client = Client("BinKhoaLe1812/MedSwin-Distilled-7B") 
+client = Client("BinKhoaLe1812/MedSwin") 
 ```
 
 Or another client:
 ```python
-client = Client("MedAI-COS30018/MedSwin-Distilled-7B")
+client = Client("MedAI-COS30018/MedSwin")
 ```
 
 ## API Endpoints
