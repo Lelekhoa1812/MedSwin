@@ -14,9 +14,11 @@ license: apache-2.0
 short_description: MedAlpaca-7B SFT & MedGemma-27b KD with RAG
 ---
 
+[Access](https://binkhoale1812-medswin.hf.space)
+
 ### Medical RAG
 
-- **LLM**: `MedAI-COS30018/MedSwin-7B-Distilled` (bf16) for response generation using `transformers`.
+- **LLM**: `MedAI-COS30018/MedSwin-7B-KD` or `MedAI-COS30018/MedSwin-7B-SFT`  (bf16) for response generation using `transformers`.
 - **Embeddings**: `abhinand/MedEmbed-large-v0.1` via `llama_index.embeddings.huggingface` for dense retrieval.
 - **Indexing**:
   - Upload `.pdf`/`.txt` → extract text → hierarchical chunking (2048/512/128, 20 overlap).
