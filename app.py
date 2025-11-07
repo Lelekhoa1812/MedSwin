@@ -3006,13 +3006,15 @@ def create_demo():
                 def _on_model_change(choice):
                     global gemini_client
                     try:
-                        if choice == "Gemini Flash 2.5":
+                        if choice == "Gemini Flash":
                             if not GEMINI_AVAILABLE:
                                 return "Error: google-genai package not installed. Install with: pip install google-genai"
                             if not GEMINI_API_KEY:
                                 return "Error: GEMINI_API_KEY not found in environment variables"
+                            # Set Gemini client - no local model loading needed
                             gemini_client = GeminiClient(api_key=GEMINI_API_KEY)
-                            return f"Loaded: {choice}"
+                            logger.info("Gemini Flash selected - using API only, no local model loading")
+                            return f"Loaded: {choice} (API only)"
                         else:
                             # Reset gemini_client when switching to HuggingFace models
                             gemini_client = None
@@ -3022,8 +3024,12 @@ def create_demo():
                                 name = MEDSWIN_SFT_MODEL
                             elif choice == "MedAlpaca-7B":
                                 name = MEDALPACA_MODEL
-                            else:  # MedGemma-27B
+                            elif choice == "MedGemma-27B":
                                 name = MEDGEMMA_MODEL
+                            else:
+                                # Unknown choice, don't try to load anything
+                                return f"Unknown model: {choice}"
+                            # Only load HuggingFace model if not using Gemini
                             initialize_model_and_tokenizer(name)
                             return f"Loaded: {choice}"
                     except PermissionError as e:
