@@ -1141,13 +1141,15 @@ def stream_chat(
             # Also check if response seems to be cut off mid-word or mid-sentence
             # Look for patterns like ending with lowercase letters followed by nothing
             if len(text) > 100:
-                last_50 = text[-50:].lower()
-                # If ends with lowercase and no punctuation, might be incomplete
-                if not any(text.rstrip()[-1] in ['.', '!', '?', ':', '\n', ')', ']', '}']):
-                    # Check if it looks like mid-sentence
-                    if not text.rstrip()[-1].isupper() and not any(incomplete_indicators):
-                        # Might be incomplete if it doesn't end with proper punctuation
-                        return False
+                text_rstrip = text.rstrip()
+                if len(text_rstrip) > 0:
+                    last_char = text_rstrip[-1]
+                    # If ends with lowercase and no punctuation, might be incomplete
+                    if last_char not in ['.', '!', '?', ':', '\n', ')', ']', '}']:
+                        # Check if it looks like mid-sentence
+                        if not last_char.isupper() and not any(incomplete_indicators):
+                            # Might be incomplete if it doesn't end with proper punctuation
+                            return False
             
             return not any(incomplete_indicators)
         
