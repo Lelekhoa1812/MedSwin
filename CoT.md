@@ -47,11 +47,13 @@ This document describes the sequential Chain-of-Thought (CoT) answering system d
   - Continuation and previous continuations
 
 **Thresholds**:
-- **Low Relevance**: Similarity < 0.3 → Likely off-topic
-- **High Repetition**: Similarity > 0.85 → Likely duplicate
-- **Sentence Duplication**: Similarity > 0.9 → Duplicate sentence
+- **Low Relevance**: Similarity < 0.2 (with 150+ chars) → Likely off-topic
+- **Medical Context**: Similarity < 0.25 (with 150+ chars) → Likely off-topic
+- **High Repetition**: Similarity > 0.9 AND token overlap > 0.9 → Likely duplicate
+- **Near-Duplicate**: Similarity > 0.95 AND token overlap > 0.85 → Near-duplicate
+- **Sentence Duplication**: Similarity > 0.9 AND token overlap > 0.9 → Duplicate sentence
 
-**Benefits**: More accurate than keyword matching, especially for medical terminology and context variations.
+**Benefits**: More accurate than keyword matching, especially for medical terminology and context variations. Uses both semantic similarity and token overlap for more precise duplicate detection.
 
 ---
 
@@ -80,9 +82,10 @@ This document describes the sequential Chain-of-Thought (CoT) answering system d
 **Purpose**: Remove duplicate content from continuations using semantic similarity.
 
 **Deduplication Methods**:
-- **Sentence-Level**: Compares each continuation sentence with previous sentences using semantic similarity (>0.9 = duplicate)
-- **Phrase-Level**: Checks 4-word phrases for semantic similarity (>0.9 = duplicate)
-- **Full-Text**: Overall similarity check (>0.85 = likely repetition)
+- **Sentence-Level**: Compares each continuation sentence with previous sentences using semantic similarity AND token overlap (>0.9 for both = duplicate)
+- **Phrase-Level**: Checks 4-word phrases for semantic similarity AND token overlap (>0.9 for both = duplicate)
+- **Full-Text**: Overall similarity check (>0.9 semantic AND >0.9 token overlap = likely repetition)
+- **Near-Duplicate**: Catches near-duplicates with >0.95 semantic AND >0.85 token overlap
 
 **Process**:
 - Extracts only new sentences from continuation
@@ -98,7 +101,8 @@ This document describes the sequential Chain-of-Thought (CoT) answering system d
 **Purpose**: Detect and stop off-topic or hallucinated content in continuations.
 
 **Detection Methods**:
-- **Semantic Similarity**: Low similarity (<0.3) with both message and response indicates off-topic
+- **Semantic Similarity**: Low similarity (<0.2) with both message and response (150+ chars) indicates off-topic
+- **Medical Context**: Low similarity (<0.25) with medical context missing indicates off-topic
 - **Keyword Analysis**: Checks for medical context keywords
 - **Pattern Matching**: Detects obvious hallucination indicators (Wikipedia links, non-medical topics, meta-content)
 - **Language Consistency**: Detects unexpected language switches
@@ -120,7 +124,7 @@ This document describes the sequential Chain-of-Thought (CoT) answering system d
 - **Topic Coherence**: Continuation should share semantic space with original response
 
 **Multi-Layer Validation**:
-- Real-time checks during streaming (every 20 chunks)
+- Real-time checks during streaming (every 30 chunks, minimum 150 chars)
 - Final validation after continuation completes
 - Semantic similarity as primary check, keyword matching as fallback
 
@@ -133,9 +137,10 @@ This document describes the sequential Chain-of-Thought (CoT) answering system d
 **Purpose**: Remove model's internal reasoning tokens that shouldn't appear in final output.
 
 **Filtered Tokens**:
-- Thought process markers (`<end_of_instructions>`, `thought process:`, `thinking:`, `reasoning:`)
+- Thought process markers (`<end_of_instructions>`, `<end_of_turn>`, `thought process:`, `thinking:`, `reasoning:`)
 - Meta-commentary (`internal:`, `meta:`, `[thinking]`, `[reasoning]`)
 - Completion phrases (`okay, i need to finish`, `i need to finish`)
+- Prompt-related tokens (`the prompt asks you`, `the user has stopped`, `provide steps involved`, `so provide steps`, `steps involved in developing`)
 
 **Process**:
 - Filters tokens from continuation before appending
@@ -172,8 +177,8 @@ This document describes the sequential Chain-of-Thought (CoT) answering system d
 - **Sequence Validation**: Checks if continuation follows expected sequence
 
 **Validation Logic**:
-- If no structure mentions AND low similarity (<0.3) → Likely off-plan
-- If numbering expected but not found AND low similarity (<0.4) → Likely off-plan
+- If no structure mentions AND low similarity (<0.2) → Likely off-plan
+- If numbering expected but not found AND low similarity (<0.25) → Likely off-plan
 - Otherwise → Accept continuation
 
 **Benefits**: Ensures continuations complete the answer plan rather than going off on tangents.
@@ -185,13 +190,17 @@ This document describes the sequential Chain-of-Thought (CoT) answering system d
 1. **Initial Generation**: Model generates up to `max_new_tokens`
 2. **Completeness Check**: System checks if response is complete
 3. **If Incomplete**:
+   - Show loader indicator (`*[Generating continuation answer...]*`) to user
+   - Log current response state (length, ending text, structure)
    - Extract answer structure and plan
-   - Build continuation prompt with context and structure hints
+   - Track covered topics to guide continuation
+   - Build methodical continuation prompt with context, structure hints, and covered topics
    - Generate continuation chunk (50% of `max_new_tokens`)
-   - Real-time hallucination detection during streaming
-   - Filter internal reasoning tokens
-   - Deduplicate using semantic similarity
+   - Real-time hallucination detection during streaming (every 30 chunks, 150+ chars)
+   - Filter internal reasoning tokens (including `<end_of_turn>`, prompt-related tokens)
+   - Deduplicate using semantic similarity AND token overlap
    - Validate context relevance and structure coherence
+   - Log continuation summary (count, length, start, end)
    - Append only new, relevant content
 4. **Repeat**: Continue until response is complete or limits reached
 5. **Final Cleanup**: Remove special tokens, clean formatting
@@ -203,10 +212,12 @@ This document describes the sequential Chain-of-Thought (CoT) answering system d
 - **Adaptive Token Usage**: Can generate 5x initial limit if needed
 - **Semantic Understanding**: Uses embeddings for accurate relevance checking
 - **Structure Preservation**: Maintains numbering, headings, and logical flow
-- **Duplicate Prevention**: Removes redundant content using semantic similarity
+- **Duplicate Prevention**: Removes redundant content using semantic similarity AND token overlap
 - **Hallucination Prevention**: Stops off-topic content before it contaminates response
 - **Context Maintenance**: Ensures continuations stay relevant to original question
 - **Clean Output**: Filters internal reasoning and special tokens
+- **User Feedback**: Shows loader indicator during continuation generation
+- **Methodical Tracking**: Logs response state, structure, and continuation summaries for debugging
 
 ---
 
@@ -235,8 +246,11 @@ This CoT system addresses all these issues by:
 - **Continuation Chunk Size**: 50% of `max_new_tokens` (e.g., 512 for 1024 limit)
 - **Max Continuations**: 10 attempts
 - **Similarity Thresholds**:
-  - Low relevance: <0.3
-  - High repetition: >0.85
-  - Duplicate sentence: >0.9
+  - Low relevance: <0.2 (150+ chars required)
+  - Medical context: <0.25 (150+ chars required)
+  - High repetition: >0.9 semantic AND >0.9 token overlap
+  - Near-duplicate: >0.95 semantic AND >0.85 token overlap
+  - Duplicate sentence: >0.9 semantic AND >0.9 token overlap
 - **EOS Prevention**: 95% of `max_new_tokens` before allowing EOS
+- **Check Frequency**: Every 30 chunks (minimum 150 chars) for hallucination detection
 

@@ -1740,6 +1740,19 @@ def _stream_chat_impl(
             if has_hallucination_indicators:
                 return True
             
+            # Check for meta-commentary patterns (instructions, clarifications, questions)
+            meta_commentary_patterns = [
+                'acknowledge incomplete', 'clarify expectations', 'state clearly',
+                'ask again', 'what specifically', 'address the core issue',
+                'wants to know more', 'what are you looking for', 'what specifically are you',
+                'emphasize the goal', 'mention "structural"', 'ask again for specific',
+                '/meh/', 'wants to know', 'what specifically are you looking'
+            ]
+            has_meta_commentary = any(pattern in continuation_lower for pattern in meta_commentary_patterns)
+            if has_meta_commentary and len(continuation_clean) > 50:
+                logger.warning(f"Meta-commentary detected in continuation: '{continuation_clean[:200]}'")
+                return True
+            
             # Use semantic similarity for more accurate topic coherence checking
             # Check similarity between continuation and original message
             message_similarity = compute_semantic_similarity(original_message, continuation_clean)
@@ -2129,18 +2142,19 @@ def _stream_chat_impl(
                     if item.lower() in final_text.lower():
                         covered_topics.append(item)
             
-            # Build methodical continuation instruction
-            continuation_instruction = "Continue the medical response from where it left off. "
+            # Build methodical continuation instruction - direct and explicit
+            continuation_instruction = "Continue the medical answer directly from the last sentence. "
             if covered_topics:
                 continuation_instruction += f"Topics already covered: {', '.join(covered_topics[:3])}. "
             if structure_hint:
                 continuation_instruction += f"{structure_hint.strip()} "
-            continuation_instruction += "Continue naturally from the last sentence. Do not repeat information already provided. Do not include meta-commentary or instructions."
+            continuation_instruction += "Provide the actual medical information. Do NOT include meta-commentary, instructions, clarifications, or questions. Do NOT acknowledge incomplete input or ask what the user wants. Simply continue the medical answer with facts and information."
             
-            # Include semantic context hint using embedding similarity
+            # Build continuation prompt - simple and direct to avoid meta-commentary
+            # Use a cleaner format that doesn't encourage instructions or clarifications
             continuation_prompt = (
                 f"{prompt}\n\n"
-                f"[Previous response (incomplete):]\n{response_tail}\n\n"
+                f"Previous response (continue from here):\n{response_tail}\n\n"
                 f"{continuation_instruction}"
             )
             
@@ -2227,11 +2241,23 @@ def _stream_chat_impl(
                         internal_check_tokens = [
                             '<end_of_instructions>', '<end_of_turn>', 'thought process:', 
                             'thinking:', 'reasoning:', 'the prompt asks you', 
-                            'the user has stopped', 'provide steps involved'
+                            'the user has stopped', 'provide steps involved',
+                            'acknowledge incomplete', 'clarify expectations', 'what specifically',
+                            'address the core issue', 'wants to know more', '/meh/'
                         ]
                         for token in internal_check_tokens:
                             check_text = check_text.replace(token, '').replace(token.lower(), '')
                             check_text = check_text.replace(token.upper(), '')
+                        
+                        # Quick check for meta-commentary patterns before full off-topic check
+                        check_text_lower = check_text.lower()
+                        meta_patterns = ['acknowledge', 'clarify', 'what specifically', 'address the core', 
+                                       'wants to know', 'what are you looking', '/meh/']
+                        if any(pattern in check_text_lower for pattern in meta_patterns) and len(check_text) > 50:
+                            logger.warning(f"Meta-commentary detected in real-time check: '{check_text[:200]}'")
+                            off_topic_detected = True
+                            stop_event.set()
+                            break
                         
                         # Check for off-topic/hallucination (only obvious ones)
                         if is_continuation_off_topic(original_response_before_continuation, check_text, message):
@@ -2281,7 +2307,10 @@ def _stream_chat_impl(
                 'okay, i need to finish', 'i need to finish', 'as though someone else',
                 '<end_of_turn>thought', '<end_of_turn>', 'end_of_turn', 'thought',
                 'the prompt asks you', 'the user has stopped', 'provide steps involved',
-                'so provide steps', 'steps involved in developing'
+                'so provide steps', 'steps involved in developing',
+                'acknowledge incomplete', 'clarify expectations', 'what specifically',
+                'address the core issue', 'wants to know more', 'what are you looking for',
+                'state clearly', 'ask again', 'emphasize the goal', 'mention "structural"'
             ]
             for token in internal_tokens:
                 continuation_clean = continuation_clean.replace(token, '')
@@ -2293,15 +2322,21 @@ def _stream_chat_impl(
             filtered_lines = []
             for line in lines:
                 line_lower = line.lower().strip()
-                # Skip lines that are clearly internal reasoning
+                # Skip lines that are clearly internal reasoning or meta-commentary
                 if any(line_lower.startswith(pattern) for pattern in [
                     'thought process', 'thinking:', 'reasoning:', 'internal:',
                     'okay, i need', 'i need to finish', 'as though someone',
                     'the prompt asks you', 'the user has stopped', 'provide steps',
-                    'so provide steps', 'steps involved'
+                    'so provide steps', 'steps involved',
+                    'acknowledge', 'clarify', 'state clearly', 'ask again',
+                    'what specifically', 'address the core', 'wants to know',
+                    'what are you looking', 'emphasize the goal'
                 ]) or any(pattern in line_lower for pattern in [
                     '<end_of_turn>', 'end_of_turn', 'thought process',
-                    'the prompt asks', 'the user has stopped responding'
+                    'the prompt asks', 'the user has stopped responding',
+                    'acknowledge incomplete', 'clarify expectations',
+                    'what specifically are you', 'address the core issue',
+                    'wants to know more', 'what are you looking for now'
                 ]):
                     continue
                 filtered_lines.append(line)
