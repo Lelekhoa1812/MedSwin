@@ -311,9 +311,30 @@ def _load_model_and_tokenizer(model_name: str):
     logger.info(f"Loading model={model_name} dtype={dtype}")
     try:
         tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
-    except ValueError as e:
+    except (ValueError, OSError) as e:
+        if "403" in str(e) or "Forbidden" in str(e) or "gated" in str(e).lower():
+            error_msg = (
+                f"Access denied to model '{model_name}'. This model is gated and requires special permissions.\n"
+                f"Please ensure your HF_TOKEN has access to gated repositories:\n"
+                f"1. Go to https://huggingface.co/settings/tokens\n"
+                f"2. Create or use a token with 'Read' access\n"
+                f"3. Enable 'Access to public gated repositories' in token settings\n"
+                f"4. Accept the model's terms at https://huggingface.co/{model_name}"
+            )
+            logger.error(error_msg)
+            raise PermissionError(error_msg) from e
         logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
-        tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, use_fast=False)
+        try:
+            tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, use_fast=False)
+        except (OSError, PermissionError) as e2:
+            if "403" in str(e2) or "Forbidden" in str(e2) or "gated" in str(e2).lower():
+                error_msg = (
+                    f"Access denied to model '{model_name}'. This model is gated and requires special permissions.\n"
+                    f"Please ensure your HF_TOKEN has access to gated repositories."
+                )
+                logger.error(error_msg)
+                raise PermissionError(error_msg) from e2
+            raise
 
     if tok.eos_token_id is None and getattr(tok, "eos_token", None) is None:
         tok.eos_token = "</s>"
@@ -327,14 +348,28 @@ def _load_model_and_tokenizer(model_name: str):
         tok.bos_token = tok.eos_token or tok.pad_token or "<s>"
     tok.padding_side = "right"
 
-    mdl = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        trust_remote_code=True,
-        token=HF_TOKEN,
-        dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
+    try:
+        mdl = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            trust_remote_code=True,
+            token=HF_TOKEN,
+            dtype=dtype,
+            low_cpu_mem_usage=True,
+        )
+    except (OSError, PermissionError) as e:
+        if "403" in str(e) or "Forbidden" in str(e) or "gated" in str(e).lower():
+            error_msg = (
+                f"Access denied to model '{model_name}'. This model is gated and requires special permissions.\n"
+                f"Please ensure your HF_TOKEN has access to gated repositories:\n"
+                f"1. Go to https://huggingface.co/settings/tokens\n"
+                f"2. Create or use a token with 'Read' access\n"
+                f"3. Enable 'Access to public gated repositories' in token settings\n"
+                f"4. Accept the model's terms at https://huggingface.co/{model_name}"
+            )
+            logger.error(error_msg)
+            raise PermissionError(error_msg) from e
+        raise
 
     if tok.pad_token_id is not None:
         mdl.config.pad_token_id = tok.pad_token_id
@@ -839,6 +874,12 @@ def create_demo():
                     value="MedSwin-7B KD",
                     label="Model"
                 )
+                model_status = gr.Textbox(
+                    label="Model Status",
+                    placeholder="Select a model...",
+                    interactive=False,
+                    visible=True
+                )
                 disable_retrieval = gr.Checkbox(
                     label="Disable document retrieval (use model ground knowledge)",
                     value=False
@@ -920,16 +961,25 @@ def create_demo():
                         )
 
                 def _on_model_change(choice):
-                    if choice == "MedSwin-7B KD":
-                        name = MEDSWIN_KD_MODEL
-                    elif choice == "MedSwin-7B SFT":
-                        name = MEDSWIN_SFT_MODEL
-                    elif choice == "MedAlpaca-7B":
-                        name = MEDALPACA_MODEL
-                    else:  # MedGemma-27B
-                        name = MEDGEMMA_MODEL
-                    initialize_model_and_tokenizer(name)
-                    return f"Loaded: {choice}"
+                    try:
+                        if choice == "MedSwin-7B KD":
+                            name = MEDSWIN_KD_MODEL
+                        elif choice == "MedSwin-7B SFT":
+                            name = MEDSWIN_SFT_MODEL
+                        elif choice == "MedAlpaca-7B":
+                            name = MEDALPACA_MODEL
+                        else:  # MedGemma-27B
+                            name = MEDGEMMA_MODEL
+                        initialize_model_and_tokenizer(name)
+                        return f"Loaded: {choice}"
+                    except PermissionError as e:
+                        error_msg = str(e)
+                        logger.error(f"Model loading failed: {error_msg}")
+                        return f"Error: {error_msg}"
+                    except Exception as e:
+                        error_msg = f"Failed to load model: {str(e)}"
+                        logger.error(f"Model loading failed: {error_msg}")
+                        return f"Error: {error_msg}"
 
                 submit_button.click(
                     fn=stream_chat,
@@ -950,7 +1000,7 @@ def create_demo():
                 model_selector.change(
                     fn=_on_model_change,
                     inputs=[model_selector],
-                    outputs=[]
+                    outputs=[model_status]
                 )
     return demo
 
