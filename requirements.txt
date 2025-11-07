@@ -10,3 +10,4 @@ llama_index.embeddings.huggingface
 llama-index-retrievers-bm25
 accelerate
 sentencepiece>=0.1.99
+google-genai

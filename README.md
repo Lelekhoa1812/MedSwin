@@ -1,5 +1,5 @@
 ---
-title: MedSwin Distilled 7B
+title: MedSwin
 emoji: 💬
 colorFrom: yellow
 colorTo: purple

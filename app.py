@@ -44,6 +44,14 @@ from tqdm import tqdm
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Gemini API support
+try:
+    from google import genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    logger.warning("google-genai not available. Install with: pip install google-genai")
 hf_logging.set_verbosity_error()
 
 # Retry configuration for ZeroGPU timeout handling
@@ -78,6 +86,9 @@ if not HF_TOKEN:
 # Set token in environment for transformers to pick up automatically (like hf auth login)
 os.environ["HF_TOKEN"] = HF_TOKEN
 os.environ["HUGGINGFACE_HUB_TOKEN"] = HF_TOKEN
+
+# Load GEMINI_API key from environment
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API")
 
 # Authenticate with HuggingFace Hub (equivalent to hf auth login)
 try:
@@ -173,6 +184,25 @@ global_tokenizer = None
 global_embedding_model = None
 global_file_info = {}
 model_cache = {}
+gemini_client = None
+
+
+class GeminiClient:
+    """Gemini API client for generating responses"""
+    
+    def __init__(self, api_key: str):
+        if not GEMINI_AVAILABLE:
+            raise ImportError("google-genai package is not installed. Install with: pip install google-genai")
+        self.client = genai.Client(api_key=api_key)
+    
+    def generate_content(self, prompt: str, model: str = "gemini-2.5-flash", temperature: float = 0.7) -> str:
+        """Generate content using Gemini API"""
+        try:
+            response = self.client.models.generate_content(model=model, contents=prompt)
+            return response.text
+        except Exception as e:
+            logger.error(f"[LLM] ❌ Error calling Gemini API: {e}")
+            return "Error generating response from Gemini."
 
 
 import html
@@ -1011,9 +1041,15 @@ def _stream_chat_impl(
     retriever_k    = int(retriever_k)    if isinstance(retriever_k,  (int, float)) else 15
     merge_threshold= float(merge_threshold) if isinstance(merge_threshold, (int, float)) else 0.5
 
-    # ensure model/tokenizer exist (uses currently selected MODEL)
-    if global_model is None or global_tokenizer is None:
-        initialize_model_and_tokenizer(MODEL)
+    # Check if Gemini is selected (completely API-based, no local model needed)
+    global gemini_client
+    use_gemini = gemini_client is not None
+    
+    # Only initialize HuggingFace model/tokenizer if NOT using Gemini
+    if not use_gemini:
+        # ensure model/tokenizer exist (uses currently selected MODEL) - only for HuggingFace models
+        if global_model is None or global_tokenizer is None:
+            initialize_model_and_tokenizer(MODEL)
 
     # --- language detection ---
     detected_lang = _detect_language(message)
@@ -1030,7 +1066,7 @@ def _stream_chat_impl(
                     "Please upload documents first or enable 'Disable document retrieval' to chat without documents."}], model_status
                 return
 
-            # Use global embedding model (loaded at startup)
+            # Use global embedding model (loaded at startup) - this is separate from LLM model
             global global_embedding_model
             if global_embedding_model is None:
                 initialize_embedding_model()
@@ -1064,13 +1100,20 @@ def _stream_chat_impl(
                 merged_nodes = merged_nodes[:min(5, len(merged_nodes))]
                 logger.info(f"[retrieval] Vietnamese query - limiting to top {len(merged_nodes)} nodes")
             
-            # merge text + normalize + truncate by tokens to keep headroom for generation
+            # merge text + normalize + truncate
             context = "\n\n".join([(n.node.text or "") for n in merged_nodes])
             context = _normalize_text(context)
             
             # For Vietnamese, use less context to avoid confusion
             max_context_tokens = 1200 if detected_lang == 'vi' else 1800
-            context = _truncate_by_tokens(context, global_tokenizer, max_tokens=max_context_tokens)
+            # Handle truncation: use tokenizer if available (HuggingFace models), otherwise truncate by characters (Gemini)
+            if not use_gemini and global_tokenizer is not None:
+                context = _truncate_by_tokens(context, global_tokenizer, max_tokens=max_context_tokens)
+            else:
+                # For Gemini (API-based), truncate by characters (rough estimate: 4 chars per token)
+                max_context_chars = max_context_tokens * 4
+                if len(context) > max_context_chars:
+                    context = context[-max_context_chars:]
 
             # compact source list
             srcs = []
@@ -1086,6 +1129,83 @@ def _stream_chat_impl(
         # fallback to no context rather than failing the chat
         context, source_info = "", ""
 
+    # --- Handle Gemini API (completely separate path, no local model dependencies) ---
+    if use_gemini:
+        # Build prompt for Gemini (simple format, no HuggingFace dependencies)
+        sys_text = (system_prompt or "").strip()
+        
+        # Handle system prompt based on language and whether RAG is enabled
+        if detected_lang == 'vi':
+            if context:
+                sys_text = f"{sys_text}\n\n[Lưu ý: Chỉ sử dụng thông tin từ ngữ cảnh tài liệu nếu nó liên quan trực tiếp đến câu hỏi.]\n\n[Document Context]\n{context}{source_info}"
+            else:
+                sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt dựa trên kiến thức y tế của bạn.]"
+        else:
+            if context:
+                sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}"
+            elif disable_retrieval:
+                sys_text = f"{sys_text}\n\n[Note: Answer based on your medical knowledge.]"
+        
+        # Build conversation messages for Gemini
+        convo_msgs = [{"role": "system", "content": sys_text}]
+        
+        # Add filtered history
+        if history:
+            max_history = 2 if detected_lang == 'vi' else 4
+            recent_history = history[-max_history:] if len(history) > max_history else history
+            for m in recent_history:
+                if m and isinstance(m, dict) and m.get("role") in ("user", "assistant"):
+                    content = m.get("content", "").strip()
+                    if len(content) > 5:
+                        if detected_lang == 'vi':
+                            hist_lang = _detect_language(content)
+                            if hist_lang == 'vi':
+                                convo_msgs.append({"role": m["role"], "content": content})
+                        else:
+                            convo_msgs.append({"role": m["role"], "content": content})
+        
+        # Add current message
+        convo_msgs.append({"role": "user", "content": message})
+        
+        # Build simple prompt for Gemini API
+        prompt_parts = []
+        for msg in convo_msgs:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "system":
+                prompt_parts.append(f"System: {content}")
+            elif role == "user":
+                prompt_parts.append(f"User: {content}")
+            elif role == "assistant":
+                prompt_parts.append(f"Assistant: {content}")
+        gemini_prompt = "\n\n".join(prompt_parts)
+        
+        # Generate response using Gemini API (non-streaming, complete response)
+        try:
+            model_status = "Gemini is generating answer..."
+            updated_history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
+            yield updated_history, model_status
+            
+            response = gemini_client.generate_content(
+                prompt=gemini_prompt,
+                model="gemini-2.5-flash",
+                temperature=float(temperature)
+            )
+            
+            # Return the complete response
+            updated_history[-1]["content"] = response
+            model_status = "Gemini complete answer generation"
+            yield updated_history, model_status
+            return
+        except Exception as e:
+            logger.error(f"Gemini generation error: {e}")
+            error_msg = f"Error generating response from Gemini: {str(e)}"
+            updated_history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": error_msg}]
+            model_status = "Gemini generation failed"
+            yield updated_history, model_status
+            return
+
+    # --- HuggingFace model path (only if NOT using Gemini) ---
     # --- prompt building (template-aware) ---
     sys_text = (system_prompt or "").strip()
     
@@ -2793,7 +2913,7 @@ def create_demo():
                     type="messages"
                 )
                 model_selector = gr.Radio(
-                    choices=["MedSwin-7B KD", "MedSwin-7B SFT", "MedAlpaca-7B", "MedGemma-27B"],
+                    choices=["MedSwin-7B KD", "MedSwin-7B SFT", "MedAlpaca-7B", "MedGemma-27B", "Gemini Flash"],
                     value="MedSwin-7B KD",
                     label="Model"
                 )
@@ -2884,17 +3004,28 @@ def create_demo():
                         )
 
                 def _on_model_change(choice):
+                    global gemini_client
                     try:
-                        if choice == "MedSwin-7B KD":
-                            name = MEDSWIN_KD_MODEL
-                        elif choice == "MedSwin-7B SFT":
-                            name = MEDSWIN_SFT_MODEL
-                        elif choice == "MedAlpaca-7B":
-                            name = MEDALPACA_MODEL
-                        else:  # MedGemma-27B
-                            name = MEDGEMMA_MODEL
-                        initialize_model_and_tokenizer(name)
-                        return f"Loaded: {choice}"
+                        if choice == "Gemini Flash 2.5":
+                            if not GEMINI_AVAILABLE:
+                                return "Error: google-genai package not installed. Install with: pip install google-genai"
+                            if not GEMINI_API_KEY:
+                                return "Error: GEMINI_API_KEY not found in environment variables"
+                            gemini_client = GeminiClient(api_key=GEMINI_API_KEY)
+                            return f"Loaded: {choice}"
+                        else:
+                            # Reset gemini_client when switching to HuggingFace models
+                            gemini_client = None
+                            if choice == "MedSwin-7B KD":
+                                name = MEDSWIN_KD_MODEL
+                            elif choice == "MedSwin-7B SFT":
+                                name = MEDSWIN_SFT_MODEL
+                            elif choice == "MedAlpaca-7B":
+                                name = MEDALPACA_MODEL
+                            else:  # MedGemma-27B
+                                name = MEDGEMMA_MODEL
+                            initialize_model_and_tokenizer(name)
+                            return f"Loaded: {choice}"
                     except PermissionError as e:
                         error_msg = str(e)
                         logger.error(f"Model loading failed: {error_msg}")
