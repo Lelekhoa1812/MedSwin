@@ -332,51 +332,67 @@ def _load_model_and_tokenizer(model_name: str):
     dtype = _select_dtype()
     logger.info(f"Loading model={model_name} dtype={dtype}")
     
-    # For gated models like MedGemma, try loading without explicit token first
-    # (relies on HF_TOKEN in environment or hf_login)
-    # If that fails, fall back to explicit token
-    try:
-        # Try loading without explicit token (uses environment/HF_TOKEN)
-        tok = AutoTokenizer.from_pretrained(model_name)
-    except (OSError, PermissionError) as e:
-        if "403" in str(e) or "Forbidden" in str(e) or "gated" in str(e).lower():
-            # Fall back to explicit token
-            logger.info(f"Trying with explicit token for {model_name}")
-            tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
-        else:
-            raise
-    except (ValueError, OSError) as e:
-        if "403" in str(e) or "Forbidden" in str(e) or "gated" in str(e).lower():
-            error_msg = (
-                f"Access denied to model '{model_name}'. This model is gated and requires special permissions.\n"
-                f"Please ensure your HF_TOKEN has access to gated repositories:\n"
-                f"1. Go to https://huggingface.co/settings/tokens\n"
-                f"2. Create or use a token with 'Read' access\n"
-                f"3. Enable 'Access to public gated repositories' in token settings\n"
-                f"4. Accept the model's terms at https://huggingface.co/{model_name}"
-            )
-            logger.error(error_msg)
-            raise PermissionError(error_msg) from e
-        logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
+    # For gated models like MedGemma, always use explicit token to ensure authentication
+    # This is more reliable than relying on environment variables
+    max_retries = 3
+    retry_delay = 2  # seconds
+    
+    # Try loading tokenizer with explicit token (more reliable for gated models)
+    tok = None
+    for attempt in range(max_retries):
         try:
-            # Try without explicit token first
-            try:
-                tok = AutoTokenizer.from_pretrained(model_name, use_fast=False)
-            except (OSError, PermissionError) as e2:
-                if "403" in str(e2) or "Forbidden" in str(e2) or "gated" in str(e2).lower():
-                    # Fall back to explicit token
-                    tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, use_fast=False)
-                else:
-                    raise
-        except (OSError, PermissionError) as e2:
-            if "403" in str(e2) or "Forbidden" in str(e2) or "gated" in str(e2).lower():
+            logger.info(f"Loading tokenizer for {model_name} (attempt {attempt + 1}/{max_retries})")
+            tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
+            break
+        except (OSError, PermissionError, Exception) as e:
+            error_str = str(e).lower()
+            if "403" in str(e) or "forbidden" in error_str or "gated" in error_str:
                 error_msg = (
                     f"Access denied to model '{model_name}'. This model is gated and requires special permissions.\n"
-                    f"Please ensure your HF_TOKEN has access to gated repositories."
+                    f"Please ensure your HF_TOKEN has access to gated repositories:\n"
+                    f"1. Go to https://huggingface.co/settings/tokens\n"
+                    f"2. Create or use a token with 'Read' access\n"
+                    f"3. Enable 'Access to public gated repositories' in token settings\n"
+                    f"4. Accept the model's terms at https://huggingface.co/{model_name}"
                 )
                 logger.error(error_msg)
-                raise PermissionError(error_msg) from e2
-            raise
+                raise PermissionError(error_msg) from e
+            elif "couldn't connect" in error_str or "connection" in error_str or "network" in error_str:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Connection error (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                else:
+                    # Try slow tokenizer as last resort before giving up
+                    logger.warning(f"Fast tokenizer failed. Trying slow tokenizer as last resort...")
+                    try:
+                        tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, use_fast=False)
+                        break
+                    except Exception as e2:
+                        error_msg = (
+                            f"Failed to connect to HuggingFace Hub to load '{model_name}'.\n"
+                            f"Please check your internet connection and try again.\n"
+                            f"If the model is gated, ensure your HF_TOKEN is valid and has access."
+                        )
+                        logger.error(error_msg)
+                        raise ConnectionError(error_msg) from e2
+            elif attempt < max_retries - 1:
+                logger.warning(f"Error loading tokenizer (attempt {attempt + 1}/{max_retries}): {e}. Retrying...")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+                continue
+            else:
+                # Try slow tokenizer as last resort
+                logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
+                try:
+                    tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, use_fast=False)
+                    break
+                except Exception as e2:
+                    raise
+    
+    if tok is None:
+        raise RuntimeError(f"Failed to load tokenizer for {model_name} after {max_retries} attempts")
 
     if tok.eos_token_id is None and getattr(tok, "eos_token", None) is None:
         tok.eos_token = "</s>"
@@ -390,47 +406,54 @@ def _load_model_and_tokenizer(model_name: str):
         tok.bos_token = tok.eos_token or tok.pad_token or "<s>"
     tok.padding_side = "right"
 
-    # Try loading without explicit token first (uses environment/HF_TOKEN)
-    # This matches the MedGemma documentation pattern
-    try:
-        mdl = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            trust_remote_code=True,
-            dtype=dtype,
-            low_cpu_mem_usage=True,
-        )
-    except (OSError, PermissionError) as e:
-        # If we get a 403/Forbidden error, try with explicit token
-        if "403" in str(e) or "Forbidden" in str(e) or "gated" in str(e).lower():
-            logger.info(f"Trying model load with explicit token for {model_name}")
-            try:
-                mdl = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    device_map="auto",
-                    trust_remote_code=True,
-                    token=HF_TOKEN,
-                    dtype=dtype,
-                    low_cpu_mem_usage=True,
+    # Load model with explicit token (more reliable for gated models)
+    retry_delay = 2
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Loading model for {model_name} (attempt {attempt + 1}/{max_retries})")
+            mdl = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",
+                trust_remote_code=True,
+                token=HF_TOKEN,
+                dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
+            break
+        except (OSError, PermissionError, Exception) as e:
+            error_str = str(e).lower()
+            if "403" in str(e) or "forbidden" in error_str or "gated" in error_str:
+                error_msg = (
+                    f"Access denied to model '{model_name}'. This model is gated and requires special permissions.\n"
+                    f"Please ensure your HF_TOKEN has access to gated repositories:\n"
+                    f"1. Go to https://huggingface.co/settings/tokens\n"
+                    f"2. Create or use a token with 'Read' access\n"
+                    f"3. Enable 'Access to public gated repositories' in token settings\n"
+                    f"4. Accept the model's terms at https://huggingface.co/{model_name}"
                 )
-            except (OSError, PermissionError) as e2:
-                # If explicit token also fails with 403, provide detailed error message
-                if "403" in str(e2) or "Forbidden" in str(e2) or "gated" in str(e2).lower():
+                logger.error(error_msg)
+                raise PermissionError(error_msg) from e
+            elif "couldn't connect" in error_str or "connection" in error_str or "network" in error_str:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Connection error (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                else:
                     error_msg = (
-                        f"Access denied to model '{model_name}'. This model is gated and requires special permissions.\n"
-                        f"Please ensure your HF_TOKEN has access to gated repositories:\n"
-                        f"1. Go to https://huggingface.co/settings/tokens\n"
-                        f"2. Create or use a token with 'Read' access\n"
-                        f"3. Enable 'Access to public gated repositories' in token settings\n"
-                        f"4. Accept the model's terms at https://huggingface.co/{model_name}"
+                        f"Failed to connect to HuggingFace Hub to load '{model_name}'.\n"
+                        f"Please check your internet connection and try again.\n"
+                        f"If the model is gated, ensure your HF_TOKEN is valid and has access."
                     )
                     logger.error(error_msg)
-                    raise PermissionError(error_msg) from e2
-                # If it's a different error, re-raise it
+                    raise ConnectionError(error_msg) from e
+            elif attempt < max_retries - 1:
+                logger.warning(f"Error loading model (attempt {attempt + 1}/{max_retries}): {e}. Retrying...")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+                continue
+            else:
                 raise
-        else:
-            # If the first attempt failed for a non-403 reason, re-raise
-            raise
 
     if tok.pad_token_id is not None:
         mdl.config.pad_token_id = tok.pad_token_id
@@ -1037,6 +1060,10 @@ def create_demo():
                         error_msg = str(e)
                         logger.error(f"Model loading failed: {error_msg}")
                         return f"Error: {error_msg}"
+                    except ConnectionError as e:
+                        error_msg = str(e)
+                        logger.error(f"Model loading failed: {error_msg}")
+                        return f"Connection Error: {error_msg}"
                     except Exception as e:
                         error_msg = f"Failed to load model: {str(e)}"
                         logger.error(f"Model loading failed: {error_msg}")
