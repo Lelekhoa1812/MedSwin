@@ -1683,24 +1683,99 @@ def _stream_chat_impl(
             logger.info(f"Response marked as incomplete: {len(final_text)} chars, ends with: '{final_text[-50:]}'")
         
         # Function to detect if continuation is repeating previous content using semantic similarity
+        def compute_token_overlap(text1, text2):
+            """Compute token overlap percentage between two texts using word and n-gram overlap.
+            
+            Returns a tuple: (word_overlap_ratio, ngram_overlap_ratio, overall_overlap)
+            """
+            import re
+            
+            # Normalize and tokenize texts (remove punctuation, lowercase, split)
+            def tokenize(text):
+                # Remove punctuation and normalize
+                text = re.sub(r'[^\w\s]', ' ', text.lower())
+                # Split into words
+                words = [w for w in text.split() if len(w) > 2]  # Only words > 2 chars
+                return words
+            
+            words1 = set(tokenize(text1))
+            words2 = set(tokenize(text2))
+            
+            if not words1 or not words2:
+                return (0.0, 0.0, 0.0)
+            
+            # Word overlap (Jaccard similarity)
+            word_intersection = words1.intersection(words2)
+            word_union = words1.union(words2)
+            word_overlap = len(word_intersection) / len(word_union) if word_union else 0.0
+            
+            # N-gram overlap (bigrams and trigrams)
+            def get_ngrams(words, n):
+                return set(tuple(words[i:i+n]) for i in range(len(words) - n + 1))
+            
+            words1_list = tokenize(text1)
+            words2_list = tokenize(text2)
+            
+            if len(words1_list) >= 2 and len(words2_list) >= 2:
+                bigrams1 = get_ngrams(words1_list, 2)
+                bigrams2 = get_ngrams(words2_list, 2)
+                bigram_intersection = bigrams1.intersection(bigrams2)
+                bigram_union = bigrams1.union(bigrams2)
+                bigram_overlap = len(bigram_intersection) / len(bigram_union) if bigram_union else 0.0
+            else:
+                bigram_overlap = 0.0
+            
+            if len(words1_list) >= 3 and len(words2_list) >= 3:
+                trigrams1 = get_ngrams(words1_list, 3)
+                trigrams2 = get_ngrams(words2_list, 3)
+                trigram_intersection = trigrams1.intersection(trigrams2)
+                trigram_union = trigrams1.union(trigrams2)
+                trigram_overlap = len(trigram_intersection) / len(trigram_union) if trigram_union else 0.0
+            else:
+                trigram_overlap = 0.0
+            
+            # Overall n-gram overlap (average of bigram and trigram)
+            ngram_overlap = (bigram_overlap + trigram_overlap) / 2 if (bigram_overlap > 0 or trigram_overlap > 0) else 0.0
+            
+            # Overall overlap (weighted average: 40% words, 60% n-grams)
+            overall_overlap = (word_overlap * 0.4) + (ngram_overlap * 0.6)
+            
+            return (word_overlap, ngram_overlap, overall_overlap)
+        
         def is_continuation_repeating(previous_text, continuation_text):
-            """Detect if continuation is repeating previous content using semantic similarity."""
+            """Detect if continuation is repeating previous content using semantic similarity AND token overlap.
+            
+            Only flags as repetition if BOTH semantic similarity > 0.9 AND token overlap > 0.9 (90%+).
+            This ensures we only remove true duplicates, not just similar content on the same topic.
+            """
             if not continuation_text or len(continuation_text.strip()) < 50:
                 return False
             
-            # Use semantic similarity for more accurate repetition detection
-            # High similarity (>0.75) indicates potential repetition (lowered for more graceful detection)
+            # Use semantic similarity for topic-level checking
             semantic_similarity = compute_semantic_similarity(previous_text, continuation_text)
             
-            if semantic_similarity > 0.75:
-                logger.warning(f"High semantic similarity detected (repetition): {semantic_similarity:.3f}")
+            # Compute token overlap (word and n-gram overlap)
+            word_overlap, ngram_overlap, overall_overlap = compute_token_overlap(previous_text, continuation_text)
+            
+            logger.info(f"Repetition check: semantic={semantic_similarity:.3f}, word_overlap={word_overlap:.3f}, ngram_overlap={ngram_overlap:.3f}, overall={overall_overlap:.3f}")
+            
+            # Only flag as repetition if BOTH semantic similarity > 0.9 AND token overlap > 0.9 (90%+)
+            # This ensures we only remove true duplicates, not just similar content on the same topic
+            if semantic_similarity > 0.9 and overall_overlap > 0.9:
+                logger.warning(f"High repetition detected: semantic={semantic_similarity:.3f}, token_overlap={overall_overlap:.3f}")
                 return True
             
-            # Also check for exact/similar sentence repetition
+            # Also check if semantic similarity is very high (>0.95) AND token overlap is high (>0.85)
+            # This catches near-duplicates
+            if semantic_similarity > 0.95 and overall_overlap > 0.85:
+                logger.warning(f"Near-duplicate detected: semantic={semantic_similarity:.3f}, token_overlap={overall_overlap:.3f}")
+                return True
+            
+            # Also check for exact/similar sentence repetition using token overlap
             continuation_lower = continuation_text.lower().strip()
             previous_lower = previous_text.lower().strip()
             
-            # Check for repeated sentences (exact matches)
+            # Check for repeated sentences (exact matches and high token overlap)
             continuation_sentences = [s.strip() for s in continuation_lower.split('.') if len(s.strip()) > 30]
             previous_sentences = [s.strip() for s in previous_lower.split('.') if len(s.strip()) > 30]
             
@@ -1711,23 +1786,28 @@ def _stream_chat_impl(
                     # Check if this sentence appears in previous text (exact match)
                     if cont_sent in previous_lower:
                         repeated_sentences += 1
-                    # Also check semantic similarity for similar sentences
+                    # Also check token overlap for similar sentences (90%+ overlap)
                     else:
-                        # Check similarity with each previous sentence
+                        # Check token overlap with each previous sentence
                         for prev_sent in previous_sentences[:10]:  # Check first 10 previous sentences
                             if len(prev_sent) > 40:
+                                # Check both semantic similarity and token overlap
                                 sent_similarity = compute_semantic_similarity(prev_sent, cont_sent)
-                                if sent_similarity > 0.8:  # Very high similarity = likely repetition (lowered for more graceful detection)
+                                _, _, sent_overlap = compute_token_overlap(prev_sent, cont_sent)
+                                
+                                # Only flag if BOTH semantic similarity > 0.9 AND token overlap > 0.9
+                                if sent_similarity > 0.9 and sent_overlap > 0.9:
                                     repeated_sentences += 1
                                     break
             
-            # If more than 40% of sentences are repeated, likely repeating
+            # If more than 50% of sentences are repeated (with 90%+ overlap), likely repeating
             if len(continuation_sentences) > 0:
                 repetition_ratio = repeated_sentences / min(len(continuation_sentences), 5)
-                if repetition_ratio > 0.4:
+                if repetition_ratio > 0.5:  # Increased threshold to 50%
+                    logger.warning(f"High sentence repetition ratio: {repetition_ratio:.2f}")
                     return True
             
-            # Check for repeated long phrases (4+ word phrases) using semantic similarity
+            # Check for repeated long phrases (4+ word phrases) using token overlap
             continuation_words = continuation_lower.split()
             if len(continuation_words) > 30:
                 repeated_phrases = 0
@@ -1738,18 +1818,23 @@ def _stream_chat_impl(
                         # Check exact match first
                         if phrase in previous_lower:
                             repeated_phrases += 1
-                        # Also check semantic similarity for similar phrases
+                        # Also check token overlap for similar phrases
                         else:
                             # Extract similar phrases from previous text
                             prev_words = previous_lower.split()
                             for j in range(len(prev_words) - 3):
                                 prev_phrase = ' '.join(prev_words[j:j+4])
                                 if len(prev_phrase) > 20:
+                                    # Check both semantic similarity and token overlap
                                     phrase_similarity = compute_semantic_similarity(prev_phrase, phrase)
-                                    if phrase_similarity > 0.8:  # Very high similarity (lowered for more graceful detection)
+                                    _, _, phrase_overlap = compute_token_overlap(prev_phrase, phrase)
+                                    
+                                    # Only flag if BOTH semantic similarity > 0.9 AND token overlap > 0.9
+                                    if phrase_similarity > 0.9 and phrase_overlap > 0.9:
                                         repeated_phrases += 1
                                         break
-                        if repeated_phrases > 3:  # More than 3 repeated phrases
+                        if repeated_phrases > 5:  # Increased threshold to 5 repeated phrases
+                            logger.warning(f"High phrase repetition: {repeated_phrases} phrases")
                             return True
             
             return False
@@ -1964,7 +2049,7 @@ def _stream_chat_impl(
                     # Remove loader indicator on first chunk
                     if continuation_chunk_count == 1:
                         # Remove loader indicator from partial_response if present
-                        partial_response_clean = partial_response.replace("*[Generating continuation answer...]*", "").strip()
+                        partial_response_clean = partial_response.replace("*[Generating continuation...]*", "").strip()
                         final_text = (partial_response_clean + continuation_text).strip()
                     else:
                         final_text = (partial_response + continuation_text).strip()
@@ -2032,12 +2117,16 @@ def _stream_chat_impl(
                     for cont_sent in continuation_sentences:
                         # Check if this sentence is new (not in original)
                         if cont_sent.lower() not in original_response_before_continuation.lower():
-                            # Also check semantic similarity
+                            # Also check BOTH semantic similarity AND token overlap (90%+ for both)
                             is_new = True
                             for orig_sent in original_sentences[-10:]:  # Check last 10 sentences
                                 sent_similarity = compute_semantic_similarity(orig_sent, cont_sent)
-                                if sent_similarity > 0.75:  # Very high similarity = duplicate (lowered for more graceful detection)
+                                _, _, sent_overlap = compute_token_overlap(orig_sent, cont_sent)
+                                
+                                # Only flag as duplicate if BOTH semantic similarity > 0.9 AND token overlap > 0.9
+                                if sent_similarity > 0.9 and sent_overlap > 0.9:
                                     is_new = False
+                                    logger.debug(f"Duplicate sentence detected: semantic={sent_similarity:.3f}, overlap={sent_overlap:.3f}")
                                     break
                             if is_new:
                                 new_sentences.append(cont_sent)
@@ -2063,9 +2152,14 @@ def _stream_chat_impl(
                                 if cont_sent.lower() not in prev_cont.lower():
                                     is_new = True
                                     for prev_sent in prev_sentences[-10:]:
+                                        # Check BOTH semantic similarity AND token overlap (90%+ for both)
                                         sent_similarity = compute_semantic_similarity(prev_sent, cont_sent)
-                                        if sent_similarity > 0.75:  # Lowered for more graceful detection
+                                        _, _, sent_overlap = compute_token_overlap(prev_sent, cont_sent)
+                                        
+                                        # Only flag as duplicate if BOTH semantic similarity > 0.9 AND token overlap > 0.9
+                                        if sent_similarity > 0.9 and sent_overlap > 0.9:
                                             is_new = False
+                                            logger.debug(f"Duplicate sentence detected: semantic={sent_similarity:.3f}, overlap={sent_overlap:.3f}")
                                             break
                                     if is_new:
                                         new_sentences.append(cont_sent)
