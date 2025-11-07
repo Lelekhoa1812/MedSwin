@@ -13,6 +13,8 @@ from transformers import (
     TextIteratorStreamer,
     StoppingCriteria,
     StoppingCriteriaList,
+    LogitsProcessor,
+    LogitsProcessorList,
 )
 from transformers import logging as hf_logging
 from huggingface_hub import login as hf_login
@@ -72,7 +74,7 @@ except Exception as e:
     logger.warning(f"Could not authenticate with HuggingFace Hub: {e}. Will try with explicit token.")
 
 # Custom UI
-TITLE = "<h1><center>Medical RAG Assistant (MedSwin-7B variants)</center></h1>"
+TITLE = "<h1><center>Medical RAG Assistant (MedSwin-7B)</center></h1>"
 DESCRIPTION = """
 <center>
 <p>Upload clinical PDFs or text (guidelines, notes, literature) to build a medical context.</p>
@@ -849,13 +851,7 @@ def stream_chat(
             return self.stop_event.is_set()
     
     class IgnoreEOSUntilMinTokens(StoppingCriteria):
-        """Prevent stopping on EOS token until we reach a minimum number of tokens.
-        
-        This works by checking if EOS token is generated before the minimum threshold.
-        If so, we replace it with a different token to prevent stopping.
-        However, since we can't modify tokens in stopping criteria, we'll use a different approach:
-        We'll temporarily set eos_token_id to None in generation kwargs.
-        """
+        """Prevent stopping on EOS token until we reach a minimum number of tokens."""
         def __init__(self, eos_token_id, min_tokens_to_ignore_eos, prompt_length):
             super().__init__()
             self.eos_token_id = eos_token_id
@@ -867,13 +863,48 @@ def stream_chat(
             new_tokens_count = input_ids.shape[-1] - self.prompt_length
             
             # If we haven't reached the minimum threshold and EOS is generated, prevent stopping
-            # Note: We can't actually prevent EOS stopping here, but we can log it
             if new_tokens_count < self.min_tokens_to_ignore_eos:
                 if input_ids[0, -1].item() == self.eos_token_id:
                     logger.warning(f"EOS token generated at {new_tokens_count} tokens (min: {self.min_tokens_to_ignore_eos}), but stopping criteria cannot prevent it")
             
             # Never stop based on this criteria alone - let other criteria handle stopping
             return False
+    
+    class PreventEOSLogitsProcessor(LogitsProcessor):
+        """Prevent EOS token from being generated until we reach a minimum number of tokens.
+        
+        This is the actual solution - we prevent EOS tokens from being generated in the first place
+        until we reach the minimum threshold. This way, the model can't stop early.
+        
+        Additionally, we can add logic to detect incomplete responses and prevent stopping
+        even after the threshold if the response seems incomplete.
+        """
+        def __init__(self, eos_token_id, min_tokens_to_ignore_eos, prompt_length, max_new_tokens):
+            self.eos_token_id = eos_token_id
+            self.min_tokens_to_ignore_eos = min_tokens_to_ignore_eos
+            self.prompt_length = prompt_length
+            self.max_new_tokens = max_new_tokens
+        
+        def __call__(self, input_ids, scores):
+            # Calculate how many new tokens have been generated
+            new_tokens_count = input_ids.shape[-1] - self.prompt_length
+            
+            # Always prevent EOS if we haven't reached the minimum threshold
+            if new_tokens_count < self.min_tokens_to_ignore_eos:
+                scores[:, self.eos_token_id] = float('-inf')
+                return scores
+            
+            # Even after reaching the threshold, be more aggressive:
+            # Only allow EOS if we're very close to max_new_tokens (within 5%)
+            # This ensures we use almost all available tokens
+            tokens_remaining = self.max_new_tokens - new_tokens_count
+            threshold_remaining = int(self.max_new_tokens * 0.05)  # 5% of max tokens
+            
+            if tokens_remaining > threshold_remaining:
+                # Still too many tokens remaining - prevent EOS
+                scores[:, self.eos_token_id] = float('-inf')
+            
+            return scores
 
     # Don't skip special tokens - they're important for proper decoding, especially for non-English languages
     # skip_special_tokens=False ensures Vietnamese and other languages decode correctly
@@ -924,9 +955,10 @@ def stream_chat(
     # Calculate prompt length for the stopping criteria
     prompt_length = enc['input_ids'].shape[-1] if isinstance(enc, dict) else enc.input_ids.shape[-1]
     
-    # Set minimum tokens before allowing EOS to stop (use 80% of max_new_tokens or min_tokens, whichever is higher)
-    # This prevents the model from stopping too early on EOS tokens
-    min_tokens_before_eos = max(min_tokens, int(max_new_tokens * 0.80))
+    # Set minimum tokens before allowing EOS to stop (use 95% of max_new_tokens or min_tokens, whichever is higher)
+    # This ensures the model generates almost all tokens before EOS can stop, preventing incomplete responses
+    # Using 95% instead of 100% allows for natural stopping at the very end if the model truly finishes
+    min_tokens_before_eos = max(min_tokens, int(max_new_tokens * 0.95))
     
     # Create stopping criteria list with both custom criteria
     stopping_criteria = StoppingCriteriaList([
@@ -934,17 +966,25 @@ def stream_chat(
         IgnoreEOSUntilMinTokens(eos_id, min_tokens_before_eos, prompt_length)
     ])
     
+    # Create logits processor to prevent EOS tokens from being generated until we reach the threshold
+    # This is the key fix - we prevent EOS tokens from being generated in the first place
+    # Pass max_new_tokens so the processor can be more aggressive about preventing early stopping
+    logits_processor = LogitsProcessorList([
+        PreventEOSLogitsProcessor(eos_id, min_tokens_before_eos, prompt_length, int(max_new_tokens))
+    ])
+    
     # Configure stop sequences to prevent premature stopping
     # Don't stop on common mid-sentence patterns that might appear in medical text
     stop_sequences = None  # Let the model use its natural EOS token
     
-    # IMPORTANT: To prevent premature EOS stopping, we use a high min_new_tokens threshold.
-    # This ensures the model generates at least 80% of max_new_tokens before EOS can stop it.
+    # IMPORTANT: To prevent premature EOS stopping, we use a very high min_new_tokens threshold.
+    # This ensures the model generates at least 95% of max_new_tokens before EOS can stop it.
     # We keep EOS enabled because disabling it causes the model to generate indefinitely and go off-topic.
     # The min_new_tokens parameter ensures the model generates enough tokens before EOS can stop.
+    # Additionally, the logits processor prevents EOS until we're very close to max_new_tokens.
     
-    # Use the higher min_new_tokens threshold (80% of max_new_tokens)
-    # This prevents EOS from stopping too early while still allowing natural stopping
+    # Use the higher min_new_tokens threshold (95% of max_new_tokens)
+    # This ensures almost all tokens are used before EOS can stop, preventing incomplete responses
     effective_min_tokens = min_tokens_before_eos
     
     # Keep EOS enabled - disabling it causes off-topic generation
@@ -958,7 +998,8 @@ def stream_chat(
         # Don't override eos_token_id in generation_config - let it use the default
     
     logger.info(f"Generation config: max_new_tokens={max_new_tokens}, min_new_tokens={effective_min_tokens}, eos_token_id={generation_eos_token_id}")
-    logger.info(f"EOS token enabled - model will generate at least {effective_min_tokens} tokens before EOS can stop")
+    logger.info(f"EOS token enabled - model will generate at least {effective_min_tokens} tokens (95% of max) before EOS can stop")
+    logger.info(f"Logits processor will prevent EOS until {min_tokens_before_eos} tokens, then allow only when <5% tokens remain")
     
     generation_kwargs = dict(
         **enc,
@@ -970,6 +1011,7 @@ def stream_chat(
         no_repeat_ngram_size=4,
         use_cache=True,
         stopping_criteria=stopping_criteria,
+        logits_processor=logits_processor,  # Add logits processor to prevent early EOS
         bad_words_ids=bad_words_ids,
         eos_token_id=generation_eos_token_id,  # Keep EOS token
         pad_token_id=pad_id,
@@ -1072,6 +1114,161 @@ def stream_chat(
         
         # Log response length for debugging
         logger.info(f"Final response length: {len(final_text)} characters, {chunk_count} chunks")
+        
+        # Function to check if response is complete
+        def is_response_complete(text):
+            """Check if the response seems complete or incomplete."""
+            if not text or len(text.strip()) < 10:
+                return False
+            
+            text = text.strip()
+            
+            # Check for incomplete indicators
+            incomplete_indicators = [
+                text.endswith(','),
+                text.endswith(';'),
+                text.endswith(' and'),
+                text.endswith(' or'),
+                text.endswith(' but'),
+                text.endswith(' with'),
+                text.endswith(' for'),
+                text.endswith(' to'),
+                text.endswith(' the'),
+                # Check if last sentence is incomplete (no period, exclamation, or question mark)
+                len(text) > 50 and not any(text.rstrip().endswith(p) for p in ['.', '!', '?', ':', '\n'])
+            ]
+            
+            # Also check if response seems to be cut off mid-word or mid-sentence
+            # Look for patterns like ending with lowercase letters followed by nothing
+            if len(text) > 100:
+                last_50 = text[-50:].lower()
+                # If ends with lowercase and no punctuation, might be incomplete
+                if not any(text.rstrip()[-1] in ['.', '!', '?', ':', '\n', ')', ']', '}']):
+                    # Check if it looks like mid-sentence
+                    if not text.rstrip()[-1].isupper() and not any(incomplete_indicators):
+                        # Might be incomplete if it doesn't end with proper punctuation
+                        return False
+            
+            return not any(incomplete_indicators)
+        
+        # Check if response is complete
+        is_complete = is_response_complete(final_text)
+        
+        # Sequential generation: continue generating if response is incomplete
+        # This allows the model to go beyond max_new_tokens to complete its answer
+        max_total_tokens = int(max_new_tokens * 3)  # Allow up to 3x max_new_tokens total
+        continuation_chunk_size = int(max_new_tokens * 0.5)  # Generate 50% more tokens each continuation
+        total_tokens_generated = chunk_count  # Approximate from chunks
+        continuation_count = 0
+        max_continuations = 5  # Maximum number of continuation attempts
+        
+        while not is_complete and continuation_count < max_continuations and total_tokens_generated < max_total_tokens:
+            continuation_count += 1
+            logger.info(f"Response incomplete - continuing generation (continuation {continuation_count}/{max_continuations})")
+            
+            # Prepare continuation prompt (use the current response as context)
+            continuation_prompt = prompt + final_text
+            
+            # Tokenize continuation prompt
+            continuation_enc = global_tokenizer(
+                continuation_prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_inp,  # Use same max input length
+                add_special_tokens=False,
+                padding=False,
+            )
+            
+            # Ensure input_ids are on the correct device
+            if hasattr(continuation_enc, 'to'):
+                continuation_enc = continuation_enc.to(global_model.device)
+            else:
+                continuation_enc = {k: v.to(global_model.device) if hasattr(v, 'to') else v for k, v in continuation_enc.items()}
+            
+            # Calculate continuation prompt length for logits processor
+            continuation_prompt_length = continuation_enc['input_ids'].shape[-1] if isinstance(continuation_enc, dict) else continuation_enc.input_ids.shape[-1]
+            
+            # Create new logits processor for continuation with correct prompt length
+            continuation_logits_processor = LogitsProcessorList([
+                PreventEOSLogitsProcessor(eos_id, int(continuation_chunk_size * 0.8), continuation_prompt_length, continuation_chunk_size)
+            ])
+            
+            # Create new streamer for continuation
+            continuation_streamer = TextIteratorStreamer(
+                global_tokenizer, 
+                skip_prompt=True, 
+                skip_special_tokens=False,
+                timeout=None
+            )
+            
+            # Create continuation generation kwargs
+            continuation_generation_kwargs = dict(
+                **continuation_enc,
+                streamer=continuation_streamer,
+                max_new_tokens=continuation_chunk_size,
+                min_new_tokens=int(continuation_chunk_size * 0.8),  # 80% of continuation chunk
+                do_sample=use_sampling,
+                repetition_penalty=max(1.1, float(penalty)),
+                no_repeat_ngram_size=4,
+                use_cache=True,
+                stopping_criteria=StoppingCriteriaList([StopOnEvent(stop_event)]),
+                logits_processor=continuation_logits_processor,  # Use continuation-specific logits processor
+                bad_words_ids=bad_words_ids,
+                eos_token_id=generation_eos_token_id,
+                pad_token_id=pad_id,
+            )
+            
+            if use_sampling:
+                continuation_generation_kwargs.update(
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    top_k=int(top_k),
+                )
+            
+            # Start continuation generation
+            continuation_thread = threading.Thread(
+                target=global_model.generate, 
+                kwargs=continuation_generation_kwargs
+            )
+            continuation_thread.start()
+            
+            # Collect continuation tokens
+            continuation_text = ""
+            continuation_chunk_count = 0
+            
+            for continuation_chunk in continuation_streamer:
+                if continuation_chunk:
+                    continuation_text += continuation_chunk
+                    continuation_chunk_count += 1
+                    # Update UI with continuation
+                    final_text = (partial_response + continuation_text).strip()
+                    updated_history[-1]["content"] = final_text
+                    yield updated_history
+            
+            # Wait for continuation thread to complete
+            continuation_thread.join(timeout=10.0)
+            
+            # Append continuation to response
+            partial_response += continuation_text
+            final_text = partial_response.strip()
+            chunk_count += continuation_chunk_count
+            total_tokens_generated += continuation_chunk_count
+            
+            # Check if continuation is complete
+            is_complete = is_response_complete(final_text)
+            
+            logger.info(f"Continuation {continuation_count} complete: {len(continuation_text)} chars, {continuation_chunk_count} chunks. Total: {len(final_text)} chars. Complete: {is_complete}")
+            
+            # If we got very few tokens in continuation, might be done
+            if continuation_chunk_count < 10:
+                logger.info("Continuation produced very few tokens, assuming complete")
+                is_complete = True
+        
+        if continuation_count > 0:
+            logger.info(f"Sequential generation complete after {continuation_count} continuation(s). Total response: {len(final_text)} chars")
+        
+        if not is_complete:
+            logger.warning(f"Response may still be incomplete after {continuation_count} continuation(s) - ends with: '{final_text[-50:]}'")
         
         if len(final_text) > 10:  # Only clean if we have meaningful content
             # Remove any special token strings that might have appeared (e.g., <|endoftext|>, </s>, etc.)
