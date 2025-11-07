@@ -6,6 +6,7 @@ import torch
 import threading
 import time
 import re, unicodedata
+import numpy as np
 
 from transformers import (
     AutoModelForCausalLM,
@@ -1233,51 +1234,137 @@ def stream_chat(
             structure = []
             lines = text.split('\n')
             
+            # Track numbering sequence to detect incomplete lists
+            expected_number = 1
+            last_number = 0
+            numbered_items = []  # Track numbered items separately
+            
             for line in lines:
                 line = line.strip()
                 # Detect headings (lines starting with numbers, letters, or common heading patterns)
                 if line and (line[0].isdigit() or line[0].isupper() or 
                             line.startswith('#') or line.startswith('**') or
-                            any(line.startswith(prefix) for prefix in ['1.', '2.', '3.', '4.', '5.', '-', '*'])):
+                            any(line.startswith(prefix) for prefix in ['1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.', '-', '*'])):
                     # Extract first few words as structure element
                     words = line.split()[:5]
                     if words:
-                        structure.append(' '.join(words).lower())
+                        structure_item = ' '.join(words).lower()
+                        structure.append(structure_item)
+                        
+                        # Track numbering for sequence detection
+                        if line[0].isdigit():
+                            try:
+                                num = int(line.split('.')[0])
+                                numbered_items.append((num, structure_item))
+                                if num > last_number:
+                                    last_number = num
+                                    expected_number = num + 1
+                            except:
+                                pass
             
-            return structure
+            # If we detected a numbered list, check if it's complete
+            if last_number > 0 and last_number < expected_number:
+                # List might be incomplete - add expected next item to structure
+                structure.append(f"item {expected_number}")
+            
+            # Return structure with numbering info
+            return {
+                'items': structure,
+                'numbered_items': numbered_items,
+                'last_number': last_number,
+                'expected_number': expected_number
+            }
+        
+        # Function to check if continuation maintains structure coherence
+        def check_structure_coherence(original_structure, continuation_text):
+            """Check if continuation maintains the structure/plan from original response using semantic similarity."""
+            # Handle both dict and list formats for structure
+            if isinstance(original_structure, dict):
+                structure_items = original_structure.get('items', [])
+                numbered_items = original_structure.get('numbered_items', [])
+                expected_number = original_structure.get('expected_number', 0)
+            else:
+                structure_items = original_structure if isinstance(original_structure, list) else []
+                numbered_items = []
+                expected_number = 0
+            
+            if not structure_items or len(structure_items) < 2:
+                return True  # No clear structure to maintain
+            
+            continuation_lower = continuation_text.lower()
+            
+            # Check if continuation mentions any structure elements
+            structure_mentions = sum(1 for struct_elem in structure_items if struct_elem in continuation_lower)
+            
+            # If continuation is substantial (>200 chars) but mentions no structure elements, might be off-plan
+            if len(continuation_text) > 200 and structure_mentions == 0:
+                # Use semantic similarity to check if continuation is still related to structure
+                structure_text = ' '.join(structure_items)
+                similarity = compute_semantic_similarity(structure_text, continuation_text)
+                
+                logger.debug(f"Structure coherence check: mentions={structure_mentions}, similarity={similarity:.3f}")
+                
+                # If similarity is very low (<0.3), likely off-plan
+                if similarity < 0.3:
+                    return False
+            
+            # Check for sequence continuation (e.g., if original had "1.", "2.", check for "3.")
+            if numbered_items and expected_number > 0:
+                # Check if continuation continues the numbering
+                continuation_has_numbering = any(
+                    continuation_lower.startswith(f"{i}.") or 
+                    f"{i}." in continuation_lower[:50]
+                    for i in range(1, 10)
+                )
+                # If original had numbering but continuation doesn't, might be off-plan
+                # But only if continuation is substantial
+                if not continuation_has_numbering and len(continuation_text) > 300:
+                    # Check semantic similarity to see if it's still on-topic
+                    structure_text = ' '.join(structure_items)
+                    similarity = compute_semantic_similarity(structure_text, continuation_text)
+                    logger.debug(f"Numbering coherence check: has_numbering={continuation_has_numbering}, similarity={similarity:.3f}")
+                    if similarity < 0.4:
+                        return False
+            
+            return True
+        
+        # Function to compute semantic similarity using embedding model
+        def compute_semantic_similarity(text1, text2):
+            """Compute semantic similarity between two texts using embedding model."""
+            try:
+                # Use the same embedding model as RAG
+                embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
+                
+                # Get embeddings
+                emb1 = embed_model.get_text_embedding(text1[:1000])  # Limit to first 1000 chars
+                emb2 = embed_model.get_text_embedding(text2[:1000])
+                
+                # Compute cosine similarity
+                emb1 = np.array(emb1)
+                emb2 = np.array(emb2)
+                
+                # Normalize
+                norm1 = np.linalg.norm(emb1)
+                norm2 = np.linalg.norm(emb2)
+                
+                if norm1 == 0 or norm2 == 0:
+                    return 0.0
+                
+                similarity = np.dot(emb1, emb2) / (norm1 * norm2)
+                return float(similarity)
+            except Exception as e:
+                logger.warning(f"Error computing semantic similarity: {e}")
+                return 0.0  # Return low similarity on error
         
         # Function to detect if continuation is off-topic or hallucinating
         def is_continuation_off_topic(original_text, continuation_text, original_message):
-            """Detect if continuation text is off-topic or hallucinating."""
+            """Detect if continuation text is off-topic or hallucinating using semantic similarity."""
             if not continuation_text or len(continuation_text.strip()) < 20:
                 return False
             
             continuation_lower = continuation_text.lower()
             original_lower = original_text.lower()
             message_lower = original_message.lower()
-            
-            # Extract key medical/context words from original message and response
-            medical_keywords = [
-                'medical', 'health', 'treatment', 'patient', 'symptom', 'diagnosis',
-                'medication', 'therapy', 'clinical', 'disease', 'condition', 'disorder',
-                'migraine', 'headache', 'pain', 'chronic', 'acute', 'preventive',
-                'pharmacological', 'dosage', 'side effect', 'contraindication', 'drug',
-                'prescription', 'dosage', 'mg', 'tablet', 'capsule', 'injection',
-                'preventive', 'prophylactic', 'abortive', 'rescue', 'maintenance'
-            ]
-            
-            # Extract topic keywords from original message
-            message_words = set(message_lower.split())
-            original_words = set(original_lower.split()[:100])  # First 100 words
-            
-            # Check if continuation contains medical keywords from original context
-            continuation_has_medical = any(keyword in continuation_lower for keyword in medical_keywords)
-            original_has_medical = any(keyword in original_lower for keyword in medical_keywords)
-            
-            # Check topic coherence - continuation should share some keywords with original
-            continuation_words = set(continuation_lower.split()[:50])  # First 50 words
-            shared_medical_words = continuation_words.intersection(set(medical_keywords))
-            shared_message_words = continuation_words.intersection(message_words)
             
             # Filter out model's internal reasoning tokens before checking
             continuation_clean = continuation_text
@@ -1305,31 +1392,52 @@ def stream_chat(
                 'wikidata', 'wikitionary', 'beautywiki',
                 # URL patterns
                 'time.com', 'britannica.com', 'globalvoices.org', 'spiegel.de',
-                # Language switching (if original was English, continuation shouldn't be German/Japanese)
-                (message_lower and not any(lang in continuation_lower[:100] for lang in ['japanisch', 'deutsch', 'kawaii']) 
-                 and any(lang in continuation_lower[:100] for lang in ['japanisch', 'deutsch']) 
-                 and not any(med in continuation_lower[:100] for med in medical_keywords))
             ]
             
-            # If continuation has hallucination indicators and no medical context, it's off-topic
-            has_hallucination_indicators = any(indicator for indicator in hallucination_indicators if isinstance(indicator, str) and indicator in continuation_lower)
-            has_language_switch = any(isinstance(ind, bool) and ind for ind in hallucination_indicators)
-            
-            if (has_hallucination_indicators or has_language_switch) and not continuation_has_medical:
+            # Check for obvious hallucination indicators
+            has_hallucination_indicators = any(indicator in continuation_lower for indicator in hallucination_indicators)
+            if has_hallucination_indicators:
                 return True
             
-            # If original had medical context but continuation doesn't, might be off-topic
-            if original_has_medical and not continuation_has_medical and len(continuation_text) > 100:
-                # Check if continuation is about completely different topics
-                non_medical_topics = ['fashion', 'anime', 'manga', 'culture', 'internet', 'viral', 'trend', 'kawaii']
-                if any(topic in continuation_lower for topic in non_medical_topics):
-                    return True
+            # Use semantic similarity for more accurate topic coherence checking
+            # Check similarity between continuation and original message
+            message_similarity = compute_semantic_similarity(original_message, continuation_clean)
             
-            # Check topic coherence - if continuation has no shared medical/message words, might be off-topic
-            if original_has_medical and len(continuation_text) > 100:
-                if len(shared_medical_words) == 0 and len(shared_message_words) == 0:
-                    # No shared keywords at all - likely off-topic
-                    return True
+            # Check similarity between continuation and original response
+            # Use last portion of original response for better context
+            original_tail = original_text[-500:] if len(original_text) > 500 else original_text
+            response_similarity = compute_semantic_similarity(original_tail, continuation_clean)
+            
+            # Log similarity scores for debugging
+            logger.debug(f"Semantic similarity check: message={message_similarity:.3f}, response={response_similarity:.3f}")
+            
+            # If continuation is semantically very different from both message and response, likely off-topic
+            # Threshold: similarity < 0.3 indicates low relevance
+            if message_similarity < 0.3 and response_similarity < 0.3 and len(continuation_clean) > 100:
+                logger.warning(f"Low semantic similarity detected: message={message_similarity:.3f}, response={response_similarity:.3f}")
+                return True
+            
+            # Extract key medical/context words from original message and response
+            medical_keywords = [
+                'medical', 'health', 'treatment', 'patient', 'symptom', 'diagnosis',
+                'medication', 'therapy', 'clinical', 'disease', 'condition', 'disorder',
+                'migraine', 'headache', 'pain', 'chronic', 'acute', 'preventive',
+                'pharmacological', 'dosage', 'side effect', 'contraindication', 'drug',
+                'prescription', 'dosage', 'mg', 'tablet', 'capsule', 'injection',
+                'preventive', 'prophylactic', 'abortive', 'rescue', 'maintenance'
+            ]
+            
+            # Check if continuation contains medical keywords from original context
+            continuation_has_medical = any(keyword in continuation_lower for keyword in medical_keywords)
+            original_has_medical = any(keyword in original_lower for keyword in medical_keywords)
+            
+            # If original had medical context but continuation doesn't AND low similarity, likely off-topic
+            if original_has_medical and not continuation_has_medical and len(continuation_text) > 100:
+                if message_similarity < 0.4:  # Lower threshold for medical context
+                    # Check if continuation is about completely different topics
+                    non_medical_topics = ['fashion', 'anime', 'manga', 'culture', 'internet', 'viral', 'trend', 'kawaii']
+                    if any(topic in continuation_lower for topic in non_medical_topics):
+                        return True
             
             # Check if continuation seems to be repeating or going in circles
             if len(continuation_text) > 200:
@@ -1346,11 +1454,11 @@ def stream_chat(
             
             return False
         
-        # Function to check if continuation is completing the answer plan
+        # Function to check if continuation is completing the answer plan using semantic similarity
         def is_continuation_on_plan(original_text, continuation_text, original_message):
-            """Check if continuation is actually continuing the original answer plan.
+            """Check if continuation is actually continuing the original answer plan using semantic similarity.
             
-            This should be less strict - only flag obvious deviations, not minor ones.
+            This uses embedding-based semantic checking for more accurate plan coherence.
             """
             if not continuation_text or len(continuation_text.strip()) < 20:
                 return True  # Too short to judge, assume OK
@@ -1369,13 +1477,37 @@ def stream_chat(
             # Extract structure from original response
             original_structure = extract_answer_structure(original_text)
             
-            # Only check structure if it's substantial (more than 3 elements)
-            # And only flag if continuation is clearly off-topic
-            if original_structure and len(original_structure) > 3:
-                structure_mentions = sum(1 for struct_elem in original_structure if struct_elem in continuation_lower)
-                # Only flag if no structure mentions AND continuation is long (>200 chars)
-                # This allows for natural continuation that might not explicitly mention structure
-                if structure_mentions == 0 and len(continuation_text) > 200:
+            # Handle both dict and list formats
+            if isinstance(original_structure, dict):
+                structure_items = original_structure.get('items', [])
+            else:
+                structure_items = original_structure if isinstance(original_structure, list) else []
+            
+            # Use semantic similarity to check plan coherence
+            # Get the last portion of original response for context
+            original_tail = original_text[-500:] if len(original_text) > 500 else original_text
+            
+            # Compute semantic similarity between continuation and original response tail
+            response_similarity = compute_semantic_similarity(original_tail, continuation_clean)
+            
+            # Compute semantic similarity between continuation and original message
+            message_similarity = compute_semantic_similarity(original_message, continuation_clean)
+            
+            # If continuation is semantically similar to original response (>0.5), likely on-plan
+            if response_similarity > 0.5:
+                # Also check structure coherence
+                if structure_items and len(structure_items) > 2:
+                    structure_coherent = check_structure_coherence(original_structure, continuation_clean)
+                    if not structure_coherent and response_similarity < 0.6:
+                        # Low similarity and structure incoherence = likely off-plan
+                        return False
+                return True
+            
+            # If similarity is low, check structure mentions
+            if structure_items and len(structure_items) > 3:
+                structure_mentions = sum(1 for struct_elem in structure_items if struct_elem in continuation_lower)
+                # Only flag if no structure mentions AND continuation is long (>200 chars) AND low similarity
+                if structure_mentions == 0 and len(continuation_text) > 200 and response_similarity < 0.4:
                     # Check if it's actually medical content (might be OK even without structure mention)
                     medical_keywords = [
                         'medical', 'health', 'treatment', 'patient', 'symptom', 'diagnosis',
@@ -1383,7 +1515,7 @@ def stream_chat(
                     ]
                     has_medical = any(keyword in continuation_lower for keyword in medical_keywords)
                     if not has_medical:
-                        # No structure AND no medical content - likely off-topic
+                        # No structure AND no medical content AND low similarity - likely off-topic
                         return False
             
             # Check if continuation starts with obviously wrong topics (very strict check)
@@ -1392,6 +1524,10 @@ def stream_chat(
                                  ['kawaii', 'wikipedia:', 'japanisch', 'deutsch', 'anime', 'manga'])
             
             if obviously_wrong:
+                return False
+            
+            # If similarity is very low (<0.3) for both message and response, likely off-plan
+            if response_similarity < 0.3 and message_similarity < 0.3 and len(continuation_clean) > 200:
                 return False
             
             # If we get here, assume it's on plan (less strict)
@@ -1406,33 +1542,23 @@ def stream_chat(
         else:
             logger.info(f"Response marked as incomplete: {len(final_text)} chars, ends with: '{final_text[-50:]}'")
         
-        # Function to detect if continuation is repeating previous content
+        # Function to detect if continuation is repeating previous content using semantic similarity
         def is_continuation_repeating(previous_text, continuation_text):
-            """Detect if continuation is repeating previous content."""
+            """Detect if continuation is repeating previous content using semantic similarity."""
             if not continuation_text or len(continuation_text.strip()) < 50:
                 return False
             
-            # Extract sentences/phrases from continuation
+            # Use semantic similarity for more accurate repetition detection
+            # High similarity (>0.85) indicates potential repetition
+            semantic_similarity = compute_semantic_similarity(previous_text, continuation_text)
+            
+            if semantic_similarity > 0.85:
+                logger.warning(f"High semantic similarity detected (repetition): {semantic_similarity:.3f}")
+                return True
+            
+            # Also check for exact/similar sentence repetition
             continuation_lower = continuation_text.lower().strip()
             previous_lower = previous_text.lower().strip()
-            
-            # If continuation is very similar to previous text (high overlap), likely repeating
-            if len(continuation_lower) > 100 and len(previous_lower) > 100:
-                # Calculate word overlap
-                continuation_words = set(continuation_lower.split())
-                previous_words = set(previous_lower.split())
-                
-                # Filter out common words
-                common_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
-                continuation_words = {w for w in continuation_words if w not in common_words and len(w) > 3}
-                previous_words = {w for w in previous_words if w not in common_words and len(w) > 3}
-                
-                if len(continuation_words) > 0:
-                    overlap = len(continuation_words.intersection(previous_words))
-                    overlap_ratio = overlap / len(continuation_words)
-                    # If more than 50% of words overlap, likely repeating
-                    if overlap_ratio > 0.5:
-                        return True
             
             # Check for repeated sentences (exact matches)
             continuation_sentences = [s.strip() for s in continuation_lower.split('.') if len(s.strip()) > 30]
@@ -1445,6 +1571,15 @@ def stream_chat(
                     # Check if this sentence appears in previous text (exact match)
                     if cont_sent in previous_lower:
                         repeated_sentences += 1
+                    # Also check semantic similarity for similar sentences
+                    else:
+                        # Check similarity with each previous sentence
+                        for prev_sent in previous_sentences[:10]:  # Check first 10 previous sentences
+                            if len(prev_sent) > 40:
+                                sent_similarity = compute_semantic_similarity(prev_sent, cont_sent)
+                                if sent_similarity > 0.9:  # Very high similarity = likely repetition
+                                    repeated_sentences += 1
+                                    break
             
             # If more than 40% of sentences are repeated, likely repeating
             if len(continuation_sentences) > 0:
@@ -1452,15 +1587,28 @@ def stream_chat(
                 if repetition_ratio > 0.4:
                     return True
             
-            # Check for repeated long phrases (4+ word phrases)
+            # Check for repeated long phrases (4+ word phrases) using semantic similarity
             continuation_words = continuation_lower.split()
             if len(continuation_words) > 30:
                 repeated_phrases = 0
                 # Check for repeated 4-word phrases
                 for i in range(len(continuation_words) - 3):
                     phrase = ' '.join(continuation_words[i:i+4])
-                    if len(phrase) > 20 and phrase in previous_lower:
-                        repeated_phrases += 1
+                    if len(phrase) > 20:
+                        # Check exact match first
+                        if phrase in previous_lower:
+                            repeated_phrases += 1
+                        # Also check semantic similarity for similar phrases
+                        else:
+                            # Extract similar phrases from previous text
+                            prev_words = previous_lower.split()
+                            for j in range(len(prev_words) - 3):
+                                prev_phrase = ' '.join(prev_words[j:j+4])
+                                if len(prev_phrase) > 20:
+                                    phrase_similarity = compute_semantic_similarity(prev_phrase, phrase)
+                                    if phrase_similarity > 0.9:  # Very high similarity
+                                        repeated_phrases += 1
+                                        break
                         if repeated_phrases > 3:  # More than 3 repeated phrases
                             return True
             
@@ -1497,16 +1645,44 @@ def stream_chat(
             # Build continuation prompt with explicit instructions to maintain plan
             structure_hint = ""
             if answer_structure:
-                structure_hint = f"\n[Answer structure/plan to continue: {', '.join(answer_structure[:3])}...]"
+                # Handle both dict and list formats
+                if isinstance(answer_structure, dict):
+                    structure_items = answer_structure.get('items', [])
+                    numbered_items = answer_structure.get('numbered_items', [])
+                    expected_number = answer_structure.get('expected_number', 0)
+                else:
+                    structure_items = answer_structure if isinstance(answer_structure, list) else []
+                    numbered_items = []
+                    expected_number = 0
+                
+                if structure_items:
+                    # Include structure elements that haven't been completed yet
+                    # Check which structure elements are already mentioned in the response
+                    mentioned_elements = [elem for elem in structure_items if elem in final_text.lower()]
+                    unmentioned_elements = [elem for elem in structure_items if elem not in mentioned_elements]
+                    
+                    # If there are unmentioned elements, include them in the hint
+                    if unmentioned_elements:
+                        structure_hint = f"\n[Answer structure/plan to continue: {', '.join(unmentioned_elements[:3])}...]"
+                    else:
+                        # All elements mentioned, check if numbering should continue
+                        if numbered_items and expected_number > 0:
+                            # Continue numbering sequence
+                            structure_hint = f"\n[Continue from item {expected_number} in the answer plan. Maintain the same structure and numbering sequence.]"
+                        else:
+                            # Just continue the sequence
+                            structure_hint = f"\n[Answer structure/plan: {', '.join(structure_items[-2:])}...]"
             
             # Build continuation prompt - simpler and more direct to avoid meta-content
+            # Include semantic context hint using embedding similarity
             continuation_prompt = (
                 f"{prompt}\n\n"
                 f"[Previous response (incomplete):]\n{response_tail}\n\n"
                 f"{structure_hint}\n\n"
                 f"Continue the medical response from where it left off. "
                 f"Stay on the same topic and complete the answer plan. "
-                f"Continue naturally from the last sentence."
+                f"Continue naturally from the last sentence. "
+                f"Do not repeat information already provided."
             )
             
             # Tokenize continuation prompt
@@ -1650,13 +1826,71 @@ def stream_chat(
                 filtered_lines.append(line)
             continuation_clean = '\n'.join(filtered_lines).strip()
             
-            # Append cleaned continuation to response only if it's on-topic
-            if continuation_clean:
+            # Deduplication: Remove duplicate content using semantic similarity
+            # Check if continuation is repeating previous content
+            if continuation_clean and len(continuation_clean) > 50:
+                # Check against original response
+                if is_continuation_repeating(original_response_before_continuation, continuation_clean):
+                    logger.warning(f"Continuation {continuation_count} is repeating original response - removing duplicates")
+                    # Try to extract only new content by comparing sentences
+                    continuation_sentences = [s.strip() for s in continuation_clean.split('.') if len(s.strip()) > 30]
+                    original_sentences = [s.strip() for s in original_response_before_continuation.split('.') if len(s.strip()) > 30]
+                    
+                    new_sentences = []
+                    for cont_sent in continuation_sentences:
+                        # Check if this sentence is new (not in original)
+                        if cont_sent.lower() not in original_response_before_continuation.lower():
+                            # Also check semantic similarity
+                            is_new = True
+                            for orig_sent in original_sentences[-10:]:  # Check last 10 sentences
+                                sent_similarity = compute_semantic_similarity(orig_sent, cont_sent)
+                                if sent_similarity > 0.85:  # Very high similarity = duplicate
+                                    is_new = False
+                                    break
+                            if is_new:
+                                new_sentences.append(cont_sent)
+                    
+                    if new_sentences:
+                        continuation_clean = '. '.join(new_sentences) + '.'
+                        logger.info(f"Extracted {len(new_sentences)} new sentences from continuation")
+                    else:
+                        logger.warning(f"Continuation {continuation_count} contains only duplicate content - discarding")
+                        continuation_clean = ""
+                
+                # Also check against previous continuations
+                if continuation_clean and previous_continuation_texts:
+                    for prev_cont in previous_continuation_texts[-2:]:  # Check last 2 continuations
+                        if is_continuation_repeating(prev_cont, continuation_clean):
+                            logger.warning(f"Continuation {continuation_count} is repeating previous continuation - removing duplicates")
+                            # Extract only new sentences
+                            continuation_sentences = [s.strip() for s in continuation_clean.split('.') if len(s.strip()) > 30]
+                            prev_sentences = [s.strip() for s in prev_cont.split('.') if len(s.strip()) > 30]
+                            
+                            new_sentences = []
+                            for cont_sent in continuation_sentences:
+                                if cont_sent.lower() not in prev_cont.lower():
+                                    is_new = True
+                                    for prev_sent in prev_sentences[-10:]:
+                                        sent_similarity = compute_semantic_similarity(prev_sent, cont_sent)
+                                        if sent_similarity > 0.85:
+                                            is_new = False
+                                            break
+                                    if is_new:
+                                        new_sentences.append(cont_sent)
+                            
+                            if new_sentences:
+                                continuation_clean = '. '.join(new_sentences) + '.'
+                            else:
+                                continuation_clean = ""
+                                break
+            
+            # Append cleaned continuation to response only if it's on-topic and not empty
+            if continuation_clean and len(continuation_clean.strip()) > 20:
                 partial_response += continuation_clean
                 final_text = partial_response.strip()
             else:
-                # If all continuation was filtered out, might be all internal reasoning
-                logger.warning(f"Continuation {continuation_count} was mostly internal reasoning - discarding")
+                # If all continuation was filtered out or is duplicate, might be all internal reasoning
+                logger.warning(f"Continuation {continuation_count} was mostly internal reasoning or duplicate - discarding")
                 final_text = original_response_before_continuation
                 partial_response = original_response_before_continuation
                 is_complete = True
