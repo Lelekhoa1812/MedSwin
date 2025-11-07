@@ -851,7 +851,13 @@ def stream_chat(
     stopping_criteria = StoppingCriteriaList([StopOnEvent(stop_event)])
     # Don't skip special tokens - they're important for proper decoding, especially for non-English languages
     # skip_special_tokens=False ensures Vietnamese and other languages decode correctly
-    streamer = TextIteratorStreamer(global_tokenizer, skip_prompt=True, skip_special_tokens=False)
+    # Use timeout=None to ensure streamer doesn't stop prematurely
+    streamer = TextIteratorStreamer(
+        global_tokenizer, 
+        skip_prompt=True, 
+        skip_special_tokens=False,
+        timeout=None  # Don't timeout - wait for all tokens
+    )
 
     # fit prompt within context window
     ctx = int(getattr(global_model.config, "max_position_embeddings", 4096))
@@ -920,6 +926,7 @@ def stream_chat(
     logger.info(f"chat_template={'yes' if used_chat_template else 'no'}  ctx={ctx}  max_inp={max_inp}  max_new={max_new_tokens}")
     logger.info(f"prompt_preview={(prompt[:300].replace(chr(10),' '))}")
     logger.info(f"prompt_length={len(prompt)} chars")
+    logger.info(f"generation_config: max_new_tokens={max_new_tokens}, min_new_tokens={min_tokens}, eos_token_id={eos_id}")
     
     # Log first few tokens to verify tokenization
     try:
@@ -927,8 +934,12 @@ def stream_chat(
         logger.info(f"first_10_tokens={test_tokens[:10]}")
     except Exception as e:
         logger.warning(f"Could not preview tokens: {e}")
+    
+    # Start generation in a separate thread
+    generation_start_time = time.time()
     thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
     thread.start()
+    logger.info(f"Generation thread started at {generation_start_time}")
 
     # prime UI
     updated_history = (history or []) + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
@@ -947,25 +958,59 @@ def stream_chat(
 
     try:
         # Wait for generation to complete properly
+        # The streamer might stop yielding before generation completes, so we need to ensure
+        # we wait for the generation thread to finish
+        last_chunk_time = time.time()
+        chunk_count = 0
+        no_chunk_timeout = 2.0  # If no chunks for 2 seconds, check if generation is done
+        
         for chunk in streamer:
             if chunk and not first_token_received.is_set():
                 first_token_received.set()
             if chunk:
                 partial_response += chunk
+                chunk_count += 1
+                last_chunk_time = time.time()
                 updated_history[-1]["content"] = partial_response
                 yield updated_history
         
+        streamer_end_time = time.time()
+        streamer_duration = streamer_end_time - generation_start_time
+        logger.info(f"Streamer exhausted after {chunk_count} chunks in {streamer_duration:.2f}s. Waiting for generation thread...")
+        
         # Wait for the generation thread to complete to ensure all tokens are processed
-        # join() returns None if thread completed, or raises/returns thread if still running
-        thread.join(timeout=5.0)
+        # Use a longer timeout to ensure we capture all tokens
+        # The streamer might stop yielding but generation could still be ongoing
+        thread_join_timeout = 15.0  # Increased timeout for longer responses
+        thread.join(timeout=thread_join_timeout)
+        
+        generation_end_time = time.time()
+        generation_duration = generation_end_time - generation_start_time
         
         # Check if thread is still alive (didn't complete)
         if thread.is_alive():
-            logger.warning("Generation thread may not have completed fully within timeout")
+            logger.warning(f"Generation thread still alive after {thread_join_timeout}s timeout (total: {generation_duration:.2f}s). Response may be incomplete.")
+            # Force stop if it's taking too long
+            stop_event.set()
+            thread.join(timeout=2.0)
+        else:
+            logger.info(f"Generation thread completed successfully in {generation_duration:.2f}s")
+        
+        # Additional check: sometimes the streamer stops early but generation completes
+        # Wait a bit more to ensure any final tokens are processed
+        # Note: We can't iterate over the streamer again, but we can check if generation is truly done
+        if not thread.is_alive():
+            # Give a small delay to ensure any final buffered tokens are processed
+            time.sleep(0.3)
+            # The streamer should have yielded all tokens by now if generation is complete
         
         # Minimal postprocessing: trim + clean filler/disclaimers
         # Only clean if we have substantial content
         final_text = (partial_response or "").strip()
+        
+        # Log response length for debugging
+        logger.info(f"Final response length: {len(final_text)} characters, {chunk_count} chunks")
+        
         if len(final_text) > 10:  # Only clean if we have meaningful content
             # Remove any special token strings that might have appeared (e.g., <|endoftext|>, </s>, etc.)
             # This is safe because we preserved special tokens during decoding for proper language handling
