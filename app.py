@@ -43,6 +43,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 hf_logging.set_verbosity_error()
 
+# Retry configuration for ZeroGPU timeout handling
+MAX_RETRIES = 3
+RETRY_DELAY = 2.0  # seconds between retries
+
 # Log if .env was loaded (after logger is initialized)
 try:
     from dotenv import load_dotenv
@@ -158,6 +162,7 @@ CSS = """
 
 global_model = None
 global_tokenizer = None
+global_embedding_model = None
 global_file_info = {}
 model_cache = {}
 
@@ -517,6 +522,18 @@ def initialize_model_and_tokenizer(model_name: str = None):
     global_tokenizer, global_model = tok, mdl
     MODEL = name
 
+def initialize_embedding_model():
+    """Initialize the embedding model at startup."""
+    global global_embedding_model
+    if global_embedding_model is None:
+        logger.info(f"Loading embedding model: {EMBEDDING_MODEL}")
+        try:
+            global_embedding_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
+            logger.info("Embedding model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load embedding model: {e}")
+            raise
+
 
 def get_llm(temperature=0.0, max_new_tokens=256, top_p=0.95, top_k=50, model_name: str = None):
     global global_model, global_tokenizer
@@ -556,19 +573,63 @@ def extract_text_from_document(file):
         return None, 0, ValueError(f"Unsupported file format: {file_extension}")
 
 
-@spaces.GPU()
+@spaces.GPU(max_duration=120)
 def create_or_update_index(files, request: gr.Request):
+    """Create or update index with retry logic for ZeroGPU timeouts."""
     global global_file_info
     
     if not files:
         return "Please provide files.", ""
+    
+    # Retry logic for ZeroGPU timeout handling
+    last_exception = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return _create_or_update_index_impl(files, request)
+        except KeyboardInterrupt:
+            # User interrupted, don't retry
+            raise
+        except Exception as e:
+            last_exception = e
+            error_msg = str(e).lower()
+            # Check if it's a timeout/abort related error
+            is_timeout = any(keyword in error_msg for keyword in [
+                'timeout', 'abort', 'exceeded', 'duration', 'max_duration',
+                'killed', 'terminated', 'interrupted', 'connection reset'
+            ])
+            
+            if is_timeout and attempt < MAX_RETRIES:
+                logger.warning(f"Index creation attempt {attempt}/{MAX_RETRIES} timed out/aborted. Retrying in {RETRY_DELAY}s...")
+                logger.warning(f"Error: {e}")
+                time.sleep(RETRY_DELAY)
+                continue
+            else:
+                # Not a timeout or max retries reached
+                logger.error(f"Index creation failed after {attempt} attempt(s): {e}")
+                if attempt >= MAX_RETRIES:
+                    return f"Error: Failed after {MAX_RETRIES} attempts. Last error: {str(e)[:200]}", ""
+                raise
+    
+    # Should not reach here, but handle it
+    if last_exception:
+        return f"Error: {str(last_exception)[:200]}", ""
+    return "Unknown error occurred.", ""
+
+
+def _create_or_update_index_impl(files, request: gr.Request):
+    """Internal implementation of create_or_update_index without retry logic."""
+    global global_file_info
     
     start_time = time.time()
     user_id = request.session_hash
     save_dir = f"./{user_id}_index"
     # Initialize LlamaIndex modules
     llm = get_llm(model_name=MODEL)
-    embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
+    # Use global embedding model (loaded at startup)
+    global global_embedding_model
+    if global_embedding_model is None:
+        initialize_embedding_model()
+    embed_model = global_embedding_model
     Settings.llm = llm
     Settings.embed_model = embed_model
     file_stats = []
@@ -671,7 +732,7 @@ def create_or_update_index(files, request: gr.Request):
     return f"Successfully indexed {len(files)} files.", output_container
 
 
-@spaces.GPU()
+@spaces.GPU(max_duration=120)
 def stream_chat(
     message: str,
     history: list,
@@ -686,6 +747,78 @@ def stream_chat(
     merge_threshold: float,
     request: gr.Request
 ):
+    """Stream chat with retry logic for ZeroGPU timeouts."""
+    # --- guards & basics ---
+    if not request:
+        yield history + [{"role": "assistant", "content": "Session initialization failed. Please refresh the page."}]
+        return
+    
+    # Retry logic for ZeroGPU timeout handling
+    last_exception = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            # Yield all chunks from the generator
+            for result in _stream_chat_impl(
+                message, history, system_prompt, disable_retrieval,
+                temperature, max_new_tokens, top_p, top_k, penalty,
+                retriever_k, merge_threshold, request
+            ):
+                yield result
+            # If we successfully completed, return
+            return
+        except (GeneratorExit, KeyboardInterrupt):
+            # Generator was closed by client or user interrupted, don't retry
+            raise
+        except Exception as e:
+            last_exception = e
+            error_msg = str(e).lower()
+            # Check if it's a timeout/abort related error
+            is_timeout = any(keyword in error_msg for keyword in [
+                'timeout', 'abort', 'exceeded', 'duration', 'max_duration',
+                'killed', 'terminated', 'interrupted', 'connection reset',
+                'generator', 'generator exit'
+            ])
+            
+            if is_timeout and attempt < MAX_RETRIES:
+                logger.warning(f"Chat generation attempt {attempt}/{MAX_RETRIES} timed out/aborted. Retrying in {RETRY_DELAY}s...")
+                logger.warning(f"Error: {e}")
+                # Yield error message to user
+                retry_msg = f"*[Generation timed out. Retrying ({attempt}/{MAX_RETRIES})...]*"
+                yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": retry_msg}]
+                time.sleep(RETRY_DELAY)
+                continue
+            else:
+                # Not a timeout or max retries reached
+                logger.error(f"Chat generation failed after {attempt} attempt(s): {e}")
+                if attempt >= MAX_RETRIES:
+                    error_content = f"Error: Generation failed after {MAX_RETRIES} attempts. Last error: {str(e)[:200]}"
+                    yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": error_content}]
+                    return
+                raise
+    
+    # Should not reach here, but handle it
+    if last_exception:
+        error_content = f"Error: {str(last_exception)[:200]}"
+        yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": error_content}]
+    else:
+        yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": "Unknown error occurred."}]
+
+
+def _stream_chat_impl(
+    message: str,
+    history: list,
+    system_prompt: str,
+    disable_retrieval: bool,
+    temperature: float,
+    max_new_tokens: int,
+    top_p: float,
+    top_k: int,
+    penalty: float,
+    retriever_k: int,
+    merge_threshold: float,
+    request: gr.Request
+):
+    """Internal implementation of stream_chat without retry logic."""
     # --- guards & basics ---
     if not request:
         yield history + [{"role": "assistant", "content": "Session initialization failed. Please refresh the page."}]
@@ -720,7 +853,11 @@ def stream_chat(
                     "Please upload documents first or enable 'Disable document retrieval' to chat without documents."}]
                 return
 
-            embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
+            # Use global embedding model (loaded at startup)
+            global global_embedding_model
+            if global_embedding_model is None:
+                initialize_embedding_model()
+            embed_model = global_embedding_model
             Settings.embed_model = embed_model
 
             storage_context = StorageContext.from_defaults(persist_dir=index_dir)
@@ -1332,8 +1469,11 @@ def stream_chat(
         def compute_semantic_similarity(text1, text2):
             """Compute semantic similarity between two texts using embedding model."""
             try:
-                # Use the same embedding model as RAG
-                embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
+                # Use global embedding model (loaded at startup)
+                global global_embedding_model
+                if global_embedding_model is None:
+                    initialize_embedding_model()
+                embed_model = global_embedding_model
                 
                 # Get embeddings
                 emb1 = embed_model.get_text_embedding(text1[:1000])  # Limit to first 1000 chars
@@ -2254,5 +2394,6 @@ def create_demo():
 
 if __name__ == "__main__":
     initialize_model_and_tokenizer()
+    initialize_embedding_model()
     demo = create_demo()
     demo.launch()
