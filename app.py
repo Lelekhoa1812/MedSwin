@@ -15,6 +15,7 @@ from transformers import (
     StoppingCriteriaList,
 )
 from transformers import logging as hf_logging
+from huggingface_hub import login as hf_login
 import spaces
 from llama_index.core import (
     StorageContext,
@@ -39,15 +40,36 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 hf_logging.set_verbosity_error()
 
+# Log if .env was loaded (after logger is initialized)
+try:
+    from dotenv import load_dotenv
+    if load_dotenv():
+        logger.info("Loaded environment variables from .env file")
+except ImportError:
+    pass
+
 MEDSWIN_KD_MODEL = "MedAI-COS30018/MedSwin-7B-KD"
 MEDSWIN_SFT_MODEL = "MedAI-COS30018/MedSwin-7B-SFT"
 MEDALPACA_MODEL = "medalpaca/medalpaca-7b"
 MEDGEMMA_MODEL = "google/medgemma-27b-text-it"
 MODEL = MEDSWIN_KD_MODEL
 EMBEDDING_MODEL = "abhinand/MedEmbed-large-v0.1"
-HF_TOKEN = os.environ.get("HF_TOKEN")
+
+# Load HF_TOKEN from environment (supports both HF_TOKEN and HUGGINGFACE_HUB_TOKEN)
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
 if not HF_TOKEN:
-    raise ValueError("HF_TOKEN not found in environment variables")
+    raise ValueError("HF_TOKEN or HUGGINGFACE_HUB_TOKEN not found in environment variables")
+
+# Set token in environment for transformers to pick up automatically (like hf auth login)
+os.environ["HF_TOKEN"] = HF_TOKEN
+os.environ["HUGGINGFACE_HUB_TOKEN"] = HF_TOKEN
+
+# Authenticate with HuggingFace Hub (equivalent to hf auth login)
+try:
+    hf_login(token=HF_TOKEN, add_to_git_credential=False)
+    logger.info("Successfully authenticated with HuggingFace Hub")
+except Exception as e:
+    logger.warning(f"Could not authenticate with HuggingFace Hub: {e}. Will try with explicit token.")
 
 # Custom UI
 TITLE = "<h1><center>Medical RAG Assistant (MedSwin-7B variants)</center></h1>"
@@ -309,8 +331,20 @@ def _select_dtype():
 def _load_model_and_tokenizer(model_name: str):
     dtype = _select_dtype()
     logger.info(f"Loading model={model_name} dtype={dtype}")
+    
+    # For gated models like MedGemma, try loading without explicit token first
+    # (relies on HF_TOKEN in environment or hf_login)
+    # If that fails, fall back to explicit token
     try:
-        tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
+        # Try loading without explicit token (uses environment/HF_TOKEN)
+        tok = AutoTokenizer.from_pretrained(model_name)
+    except (OSError, PermissionError) as e:
+        if "403" in str(e) or "Forbidden" in str(e) or "gated" in str(e).lower():
+            # Fall back to explicit token
+            logger.info(f"Trying with explicit token for {model_name}")
+            tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
+        else:
+            raise
     except (ValueError, OSError) as e:
         if "403" in str(e) or "Forbidden" in str(e) or "gated" in str(e).lower():
             error_msg = (
@@ -325,7 +359,15 @@ def _load_model_and_tokenizer(model_name: str):
             raise PermissionError(error_msg) from e
         logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
         try:
-            tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, use_fast=False)
+            # Try without explicit token first
+            try:
+                tok = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+            except (OSError, PermissionError) as e2:
+                if "403" in str(e2) or "Forbidden" in str(e2) or "gated" in str(e2).lower():
+                    # Fall back to explicit token
+                    tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, use_fast=False)
+                else:
+                    raise
         except (OSError, PermissionError) as e2:
             if "403" in str(e2) or "Forbidden" in str(e2) or "gated" in str(e2).lower():
                 error_msg = (
@@ -348,28 +390,47 @@ def _load_model_and_tokenizer(model_name: str):
         tok.bos_token = tok.eos_token or tok.pad_token or "<s>"
     tok.padding_side = "right"
 
+    # Try loading without explicit token first (uses environment/HF_TOKEN)
+    # This matches the MedGemma documentation pattern
     try:
         mdl = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map="auto",
             trust_remote_code=True,
-            token=HF_TOKEN,
             dtype=dtype,
             low_cpu_mem_usage=True,
         )
     except (OSError, PermissionError) as e:
+        # If we get a 403/Forbidden error, try with explicit token
         if "403" in str(e) or "Forbidden" in str(e) or "gated" in str(e).lower():
-            error_msg = (
-                f"Access denied to model '{model_name}'. This model is gated and requires special permissions.\n"
-                f"Please ensure your HF_TOKEN has access to gated repositories:\n"
-                f"1. Go to https://huggingface.co/settings/tokens\n"
-                f"2. Create or use a token with 'Read' access\n"
-                f"3. Enable 'Access to public gated repositories' in token settings\n"
-                f"4. Accept the model's terms at https://huggingface.co/{model_name}"
-            )
-            logger.error(error_msg)
-            raise PermissionError(error_msg) from e
-        raise
+            logger.info(f"Trying model load with explicit token for {model_name}")
+            try:
+                mdl = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    device_map="auto",
+                    trust_remote_code=True,
+                    token=HF_TOKEN,
+                    dtype=dtype,
+                    low_cpu_mem_usage=True,
+                )
+            except (OSError, PermissionError) as e2:
+                # If explicit token also fails with 403, provide detailed error message
+                if "403" in str(e2) or "Forbidden" in str(e2) or "gated" in str(e2).lower():
+                    error_msg = (
+                        f"Access denied to model '{model_name}'. This model is gated and requires special permissions.\n"
+                        f"Please ensure your HF_TOKEN has access to gated repositories:\n"
+                        f"1. Go to https://huggingface.co/settings/tokens\n"
+                        f"2. Create or use a token with 'Read' access\n"
+                        f"3. Enable 'Access to public gated repositories' in token settings\n"
+                        f"4. Accept the model's terms at https://huggingface.co/{model_name}"
+                    )
+                    logger.error(error_msg)
+                    raise PermissionError(error_msg) from e2
+                # If it's a different error, re-raise it
+                raise
+        else:
+            # If the first attempt failed for a non-403 reason, re-raise
+            raise
 
     if tok.pad_token_id is not None:
         mdl.config.pad_token_id = tok.pad_token_id
