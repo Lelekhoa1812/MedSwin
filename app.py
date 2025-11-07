@@ -938,21 +938,27 @@ def stream_chat(
     # Don't stop on common mid-sentence patterns that might appear in medical text
     stop_sequences = None  # Let the model use its natural EOS token
     
-    # IMPORTANT: To prevent premature EOS stopping, we temporarily set eos_token_id to None.
-    # This prevents the model from stopping early on EOS tokens.
-    # The model will generate until max_new_tokens is reached, which ensures complete responses.
-    # We rely on max_new_tokens to stop generation, not EOS tokens.
-    # This is safe because max_new_tokens will always stop generation at the limit.
+    # IMPORTANT: To prevent premature EOS stopping, we use a high min_new_tokens threshold.
+    # This ensures the model generates at least 80% of max_new_tokens before EOS can stop it.
+    # We keep EOS enabled because disabling it causes the model to generate indefinitely and go off-topic.
+    # The min_new_tokens parameter ensures the model generates enough tokens before EOS can stop.
     
-    # Temporarily disable EOS token stopping to prevent premature stopping
-    # The model will generate until max_new_tokens is reached
-    generation_eos_token_id = None  # Disable EOS stopping to prevent premature stopping
-    
-    # Use the higher min_new_tokens threshold
+    # Use the higher min_new_tokens threshold (80% of max_new_tokens)
+    # This prevents EOS from stopping too early while still allowing natural stopping
     effective_min_tokens = min_tokens_before_eos
     
-    logger.info(f"Generation config: max_new_tokens={max_new_tokens}, min_new_tokens={effective_min_tokens}, eos_token_id={generation_eos_token_id} (disabled)")
-    logger.info(f"EOS token stopping disabled - model will generate until max_new_tokens ({max_new_tokens}) is reached")
+    # Keep EOS enabled - disabling it causes off-topic generation
+    # Instead, rely on min_new_tokens to prevent early stopping
+    generation_eos_token_id = eos_id  # Keep EOS enabled
+    
+    # Update model's generation_config to ensure our settings take effect
+    if hasattr(global_model, 'generation_config'):
+        global_model.generation_config.min_new_tokens = effective_min_tokens
+        global_model.generation_config.max_new_tokens = int(max_new_tokens)
+        # Don't override eos_token_id in generation_config - let it use the default
+    
+    logger.info(f"Generation config: max_new_tokens={max_new_tokens}, min_new_tokens={effective_min_tokens}, eos_token_id={generation_eos_token_id}")
+    logger.info(f"EOS token enabled - model will generate at least {effective_min_tokens} tokens before EOS can stop")
     
     generation_kwargs = dict(
         **enc,
@@ -981,7 +987,8 @@ def stream_chat(
     logger.info(f"chat_template={'yes' if used_chat_template else 'no'}  ctx={ctx}  max_inp={max_inp}  max_new={max_new_tokens}")
     logger.info(f"prompt_preview={(prompt[:300].replace(chr(10),' '))}")
     logger.info(f"prompt_length={len(prompt)} chars")
-    logger.info(f"generation_config: max_new_tokens={max_new_tokens}, min_new_tokens={min_tokens}, eos_token_id={eos_id}")
+    # Log the ACTUAL values we're using, not the old ones
+    logger.info(f"generation_config: max_new_tokens={max_new_tokens}, min_new_tokens={effective_min_tokens}, eos_token_id={generation_eos_token_id}")
     
     # Log first few tokens to verify tokenization
     try:
@@ -1179,7 +1186,7 @@ def create_demo():
                             minimum=64,
                             maximum=1024,
                             step=32,
-                            value=512,
+                            value=768,
                             label="Max New Tokens",
                         )
                         top_p = gr.Slider(
