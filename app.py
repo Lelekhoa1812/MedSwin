@@ -1346,111 +1346,113 @@ def _stream_chat_impl(
     except Exception as e:
         logger.warning(f"Could not preview tokens: {e}")
     
-    # Handle resume from cache if available
-    if resume_from_cache:
-        logger.info(f"Resuming from cache: {len(resume_from_cache)} chars, continuation: {resume_continuation_count}")
-        partial_response = resume_from_cache
-        final_text = partial_response
-        chunk_count = 0  # No chunks generated yet
-        # Update history with cached response
-        updated_history = history + [{"role": "user", "content": message}]
-        if partial_response:
-            updated_history.append({"role": "assistant", "content": partial_response})
-            yield updated_history
-        # Skip initial generation and go straight to continuation logic
-        skip_initial_generation = True
-    else:
-        # Start generation in a separate thread
-        generation_start_time = time.time()
-        thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
-        thread.start()
-        logger.info(f"Generation thread started at {generation_start_time}")
-
-        # prime UI
-        updated_history = (history or []) + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
-        yield updated_history
-
-        partial_response = ""
-        skip_initial_generation = False
-        
-        first_token_received = threading.Event()
-
-        def _watch_first_token():
-            if not first_token_received.wait(timeout=45):
-                logger.warning("Generation timeout: no tokens in 45s; stopping stream.")
-                stop_event.set()
-
-        watchdog = threading.Thread(target=_watch_first_token, daemon=True)
-        watchdog.start()
-
-        # Wait for generation to complete properly
-        # The streamer might stop yielding before generation completes, so we need to ensure
-        # we wait for the generation thread to finish
-        last_chunk_time = time.time()
-        chunk_count = 0
-        no_chunk_timeout = 2.0  # If no chunks for 2 seconds, check if generation is done
-        
-        for chunk in streamer:
-            if chunk and not first_token_received.is_set():
-                first_token_received.set()
-            if chunk:
-                partial_response += chunk
-                chunk_count += 1
-                last_chunk_time = time.time()
-                updated_history[-1]["content"] = partial_response
-                
-                # Save cache periodically (every 50 chunks to avoid overhead)
-                if cache_key and chunk_count % 50 == 0:
-                    _save_cache(cache_key, partial_response, 0, {'chunk_count': chunk_count})
-                
+    # Wrap generation logic in try-except for error handling
+    try:
+        # Handle resume from cache if available
+        if resume_from_cache:
+            logger.info(f"Resuming from cache: {len(resume_from_cache)} chars, continuation: {resume_continuation_count}")
+            partial_response = resume_from_cache
+            final_text = partial_response
+            chunk_count = 0  # No chunks generated yet
+            # Update history with cached response
+            updated_history = history + [{"role": "user", "content": message}]
+            if partial_response:
+                updated_history.append({"role": "assistant", "content": partial_response})
                 yield updated_history
-        
-        if not skip_initial_generation:
-            streamer_end_time = time.time()
-            streamer_duration = streamer_end_time - generation_start_time
-            logger.info(f"Streamer exhausted after {chunk_count} chunks in {streamer_duration:.2f}s. Waiting for generation thread...")
-            
-            # Wait for the generation thread to complete to ensure all tokens are processed
-            # Use a longer timeout to ensure we capture all tokens
-            # The streamer might stop yielding but generation could still be ongoing
-            thread_join_timeout = 15.0  # Increased timeout for longer responses
-            thread.join(timeout=thread_join_timeout)
-            
-            generation_end_time = time.time()
-            generation_duration = generation_end_time - generation_start_time
-            
-            # Check if thread is still alive (didn't complete)
-            if thread.is_alive():
-                logger.warning(f"Generation thread still alive after {thread_join_timeout}s timeout (total: {generation_duration:.2f}s). Response may be incomplete.")
-                # Force stop if it's taking too long
-                stop_event.set()
-                thread.join(timeout=2.0)
-            else:
-                logger.info(f"Generation thread completed successfully in {generation_duration:.2f}s")
-            
-            # Additional check: sometimes the streamer stops early but generation completes
-            # Wait a bit more to ensure any final tokens are processed
-            # Note: We can't iterate over the streamer again, but we can check if generation is truly done
-            if not thread.is_alive():
-                # Give a small delay to ensure any final buffered tokens are processed
-                time.sleep(0.3)
-                # The streamer should have yielded all tokens by now if generation is complete
-            
-            # Minimal postprocessing: trim + clean filler/disclaimers
-            # Only clean if we have substantial content
-            final_text = (partial_response or "").strip()
-            
-            # Save cache after initial generation
-            if cache_key and final_text:
-                _save_cache(cache_key, final_text, 0, {'chunk_count': chunk_count, 'stage': 'initial'})
-            
-            # Log response length for debugging
-            logger.info(f"Final response length: {len(final_text)} characters, {chunk_count} chunks")
+            # Skip initial generation and go straight to continuation logic
+            skip_initial_generation = True
         else:
-            # When resuming from cache, initialize continuation_count from cache
-            continuation_count = resume_continuation_count
-            # Mark response as incomplete to continue from where we left off
-            is_complete = False
+            # Start generation in a separate thread
+            generation_start_time = time.time()
+            thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
+            thread.start()
+            logger.info(f"Generation thread started at {generation_start_time}")
+
+            # prime UI
+            updated_history = (history or []) + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
+            yield updated_history
+
+            partial_response = ""
+            skip_initial_generation = False
+            
+            first_token_received = threading.Event()
+
+            def _watch_first_token():
+                if not first_token_received.wait(timeout=45):
+                    logger.warning("Generation timeout: no tokens in 45s; stopping stream.")
+                    stop_event.set()
+
+            watchdog = threading.Thread(target=_watch_first_token, daemon=True)
+            watchdog.start()
+
+            # Wait for generation to complete properly
+            # The streamer might stop yielding before generation completes, so we need to ensure
+            # we wait for the generation thread to finish
+            last_chunk_time = time.time()
+            chunk_count = 0
+            no_chunk_timeout = 2.0  # If no chunks for 2 seconds, check if generation is done
+            
+            for chunk in streamer:
+                if chunk and not first_token_received.is_set():
+                    first_token_received.set()
+                if chunk:
+                    partial_response += chunk
+                    chunk_count += 1
+                    last_chunk_time = time.time()
+                    updated_history[-1]["content"] = partial_response
+                    
+                    # Save cache periodically (every 50 chunks to avoid overhead)
+                    if cache_key and chunk_count % 50 == 0:
+                        _save_cache(cache_key, partial_response, 0, {'chunk_count': chunk_count})
+                    
+                    yield updated_history
+            
+            if not skip_initial_generation:
+                streamer_end_time = time.time()
+                streamer_duration = streamer_end_time - generation_start_time
+                logger.info(f"Streamer exhausted after {chunk_count} chunks in {streamer_duration:.2f}s. Waiting for generation thread...")
+                
+                # Wait for the generation thread to complete to ensure all tokens are processed
+                # Use a longer timeout to ensure we capture all tokens
+                # The streamer might stop yielding but generation could still be ongoing
+                thread_join_timeout = 15.0  # Increased timeout for longer responses
+                thread.join(timeout=thread_join_timeout)
+                
+                generation_end_time = time.time()
+                generation_duration = generation_end_time - generation_start_time
+                
+                # Check if thread is still alive (didn't complete)
+                if thread.is_alive():
+                    logger.warning(f"Generation thread still alive after {thread_join_timeout}s timeout (total: {generation_duration:.2f}s). Response may be incomplete.")
+                    # Force stop if it's taking too long
+                    stop_event.set()
+                    thread.join(timeout=2.0)
+                else:
+                    logger.info(f"Generation thread completed successfully in {generation_duration:.2f}s")
+                
+                # Additional check: sometimes the streamer stops early but generation completes
+                # Wait a bit more to ensure any final tokens are processed
+                # Note: We can't iterate over the streamer again, but we can check if generation is truly done
+                if not thread.is_alive():
+                    # Give a small delay to ensure any final buffered tokens are processed
+                    time.sleep(0.3)
+                    # The streamer should have yielded all tokens by now if generation is complete
+                
+                # Minimal postprocessing: trim + clean filler/disclaimers
+                # Only clean if we have substantial content
+                final_text = (partial_response or "").strip()
+                
+                # Save cache after initial generation
+                if cache_key and final_text:
+                    _save_cache(cache_key, final_text, 0, {'chunk_count': chunk_count, 'stage': 'initial'})
+                
+                # Log response length for debugging
+                logger.info(f"Final response length: {len(final_text)} characters, {chunk_count} chunks")
+            else:
+                # When resuming from cache, initialize continuation_count from cache
+                continuation_count = resume_continuation_count
+                # Mark response as incomplete to continue from where we left off
+                is_complete = False
         
         # Function to check if response is complete
         def is_response_complete(text):
