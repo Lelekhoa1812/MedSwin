@@ -1304,8 +1304,8 @@ def stream_chat(
                 
                 logger.debug(f"Structure coherence check: mentions={structure_mentions}, similarity={similarity:.3f}")
                 
-                # If similarity is very low (<0.3), likely off-plan
-                if similarity < 0.3:
+                # If similarity is very low (<0.2), likely off-plan (lowered for more graceful detection)
+                if similarity < 0.2:
                     return False
             
             # Check for sequence continuation (e.g., if original had "1.", "2.", check for "3.")
@@ -1323,7 +1323,7 @@ def stream_chat(
                     structure_text = ' '.join(structure_items)
                     similarity = compute_semantic_similarity(structure_text, continuation_text)
                     logger.debug(f"Numbering coherence check: has_numbering={continuation_has_numbering}, similarity={similarity:.3f}")
-                    if similarity < 0.4:
+                    if similarity < 0.25:
                         return False
             
             return True
@@ -1412,8 +1412,8 @@ def stream_chat(
             logger.debug(f"Semantic similarity check: message={message_similarity:.3f}, response={response_similarity:.3f}")
             
             # If continuation is semantically very different from both message and response, likely off-topic
-            # Threshold: similarity < 0.3 indicates low relevance
-            if message_similarity < 0.3 and response_similarity < 0.3 and len(continuation_clean) > 100:
+            # Threshold: similarity < 0.2 indicates low relevance (lowered for more graceful detection)
+            if message_similarity < 0.2 and response_similarity < 0.2 and len(continuation_clean) > 150:
                 logger.warning(f"Low semantic similarity detected: message={message_similarity:.3f}, response={response_similarity:.3f}")
                 return True
             
@@ -1432,8 +1432,8 @@ def stream_chat(
             original_has_medical = any(keyword in original_lower for keyword in medical_keywords)
             
             # If original had medical context but continuation doesn't AND low similarity, likely off-topic
-            if original_has_medical and not continuation_has_medical and len(continuation_text) > 100:
-                if message_similarity < 0.4:  # Lower threshold for medical context
+            if original_has_medical and not continuation_has_medical and len(continuation_text) > 150:
+                if message_similarity < 0.25:  # Lower threshold for medical context (more graceful)
                     # Check if continuation is about completely different topics
                     non_medical_topics = ['fashion', 'anime', 'manga', 'culture', 'internet', 'viral', 'trend', 'kawaii']
                     if any(topic in continuation_lower for topic in non_medical_topics):
@@ -1498,16 +1498,16 @@ def stream_chat(
                 # Also check structure coherence
                 if structure_items and len(structure_items) > 2:
                     structure_coherent = check_structure_coherence(original_structure, continuation_clean)
-                    if not structure_coherent and response_similarity < 0.6:
-                        # Low similarity and structure incoherence = likely off-plan
+                    if not structure_coherent and response_similarity < 0.5:
+                        # Low similarity and structure incoherence = likely off-plan (lowered for more graceful detection)
                         return False
                 return True
             
             # If similarity is low, check structure mentions
             if structure_items and len(structure_items) > 3:
                 structure_mentions = sum(1 for struct_elem in structure_items if struct_elem in continuation_lower)
-                # Only flag if no structure mentions AND continuation is long (>200 chars) AND low similarity
-                if structure_mentions == 0 and len(continuation_text) > 200 and response_similarity < 0.4:
+                # Only flag if no structure mentions AND continuation is long (>200 chars) AND low similarity (lowered for more graceful detection)
+                if structure_mentions == 0 and len(continuation_text) > 200 and response_similarity < 0.3:
                     # Check if it's actually medical content (might be OK even without structure mention)
                     medical_keywords = [
                         'medical', 'health', 'treatment', 'patient', 'symptom', 'diagnosis',
@@ -1526,8 +1526,8 @@ def stream_chat(
             if obviously_wrong:
                 return False
             
-            # If similarity is very low (<0.3) for both message and response, likely off-plan
-            if response_similarity < 0.3 and message_similarity < 0.3 and len(continuation_clean) > 200:
+            # If similarity is very low (<0.2) for both message and response, likely off-plan (lowered for more graceful detection)
+            if response_similarity < 0.2 and message_similarity < 0.2 and len(continuation_clean) > 200:
                 return False
             
             # If we get here, assume it's on plan (less strict)
@@ -1549,10 +1549,10 @@ def stream_chat(
                 return False
             
             # Use semantic similarity for more accurate repetition detection
-            # High similarity (>0.85) indicates potential repetition
+            # High similarity (>0.75) indicates potential repetition (lowered for more graceful detection)
             semantic_similarity = compute_semantic_similarity(previous_text, continuation_text)
             
-            if semantic_similarity > 0.85:
+            if semantic_similarity > 0.75:
                 logger.warning(f"High semantic similarity detected (repetition): {semantic_similarity:.3f}")
                 return True
             
@@ -1577,7 +1577,7 @@ def stream_chat(
                         for prev_sent in previous_sentences[:10]:  # Check first 10 previous sentences
                             if len(prev_sent) > 40:
                                 sent_similarity = compute_semantic_similarity(prev_sent, cont_sent)
-                                if sent_similarity > 0.9:  # Very high similarity = likely repetition
+                                if sent_similarity > 0.8:  # Very high similarity = likely repetition (lowered for more graceful detection)
                                     repeated_sentences += 1
                                     break
             
@@ -1606,7 +1606,7 @@ def stream_chat(
                                 prev_phrase = ' '.join(prev_words[j:j+4])
                                 if len(prev_phrase) > 20:
                                     phrase_similarity = compute_semantic_similarity(prev_phrase, phrase)
-                                    if phrase_similarity > 0.9:  # Very high similarity
+                                    if phrase_similarity > 0.8:  # Very high similarity (lowered for more graceful detection)
                                         repeated_phrases += 1
                                         break
                         if repeated_phrases > 3:  # More than 3 repeated phrases
@@ -1633,10 +1633,28 @@ def stream_chat(
             
             continuation_count += 1
             logger.info(f"Response incomplete - continuing generation (continuation {continuation_count}/{max_continuations})")
+            logger.info(f"Current response length: {len(final_text)} chars, ends with: '{final_text[-100:]}'")
+            
+            # Add loader indicator to show sequential generation is happening
+            loader_indicator = "\n\n*[Generating continuation answer...]*"
+            updated_history[-1]["content"] = final_text + loader_indicator
+            yield updated_history
             
             # Prepare continuation prompt more carefully to maintain context and answer plan
             # Extract the answer structure/plan from original response
             answer_structure = extract_answer_structure(original_response_before_continuation)
+            
+            # Log structure information for tracking
+            if isinstance(answer_structure, dict):
+                structure_items = answer_structure.get('items', [])
+                numbered_items = answer_structure.get('numbered_items', [])
+                expected_number = answer_structure.get('expected_number', 0)
+                logger.info(f"Answer structure: {len(structure_items)} items, last number: {answer_structure.get('last_number', 0)}, expected: {expected_number}")
+            else:
+                structure_items = answer_structure if isinstance(answer_structure, list) else []
+                numbered_items = []
+                expected_number = 0
+                logger.info(f"Answer structure: {len(structure_items)} items")
             
             # Use the last portion of the response to maintain context
             # But also include key structure elements to maintain the plan
@@ -1673,17 +1691,31 @@ def stream_chat(
                             # Just continue the sequence
                             structure_hint = f"\n[Answer structure/plan: {', '.join(structure_items[-2:])}...]"
             
-            # Build continuation prompt - simpler and more direct to avoid meta-content
+            # Build continuation prompt - methodical and direct to maintain content flow
+            # Track what has been covered to guide continuation
+            covered_topics = []
+            if structure_items:
+                # Check which structure items are already mentioned
+                for item in structure_items:
+                    if item.lower() in final_text.lower():
+                        covered_topics.append(item)
+            
+            # Build methodical continuation instruction
+            continuation_instruction = "Continue the medical response from where it left off. "
+            if covered_topics:
+                continuation_instruction += f"Topics already covered: {', '.join(covered_topics[:3])}. "
+            if structure_hint:
+                continuation_instruction += f"{structure_hint.strip()} "
+            continuation_instruction += "Continue naturally from the last sentence. Do not repeat information already provided. Do not include meta-commentary or instructions."
+            
             # Include semantic context hint using embedding similarity
             continuation_prompt = (
                 f"{prompt}\n\n"
                 f"[Previous response (incomplete):]\n{response_tail}\n\n"
-                f"{structure_hint}\n\n"
-                f"Continue the medical response from where it left off. "
-                f"Stay on the same topic and complete the answer plan. "
-                f"Continue naturally from the last sentence. "
-                f"Do not repeat information already provided."
+                f"{continuation_instruction}"
             )
+            
+            logger.info(f"Continuation prompt length: {len(continuation_prompt)} chars, structure hint: {bool(structure_hint)}")
             
             # Tokenize continuation prompt
             continuation_enc = global_tokenizer(
@@ -1759,12 +1791,18 @@ def stream_chat(
                     continuation_chunk_count += 1
                     
                     # Check for hallucination after collecting some text (less frequent checks)
-                    # Only check every 20 chunks to avoid false positives
-                    if len(continuation_text) > 100 and continuation_chunk_count % 20 == 0:
+                    # Only check every 30 chunks to avoid false positives (increased from 20)
+                    if len(continuation_text) > 150 and continuation_chunk_count % 30 == 0:
                         # Filter internal tokens before checking
                         check_text = continuation_text
-                        for token in ['<end_of_instructions>', 'thought process:', 'thinking:', 'reasoning:']:
+                        internal_check_tokens = [
+                            '<end_of_instructions>', '<end_of_turn>', 'thought process:', 
+                            'thinking:', 'reasoning:', 'the prompt asks you', 
+                            'the user has stopped', 'provide steps involved'
+                        ]
+                        for token in internal_check_tokens:
                             check_text = check_text.replace(token, '').replace(token.lower(), '')
+                            check_text = check_text.replace(token.upper(), '')
                         
                         # Check for off-topic/hallucination (only obvious ones)
                         if is_continuation_off_topic(original_response_before_continuation, check_text, message):
@@ -1782,8 +1820,14 @@ def stream_chat(
                                 # Only log, don't stop - continuation might still be valid
                                 logger.debug(f"Continuation {continuation_count} may not be following the answer plan after {len(continuation_text)} chars")
                     
-                    # Update UI with continuation
-                    final_text = (partial_response + continuation_text).strip()
+                    # Update UI with continuation (remove loader indicator once we have content)
+                    # Remove loader indicator on first chunk
+                    if continuation_chunk_count == 1:
+                        # Remove loader indicator from partial_response if present
+                        partial_response_clean = partial_response.replace("*[Generating continuation answer...]*", "").strip()
+                        final_text = (partial_response_clean + continuation_text).strip()
+                    else:
+                        final_text = (partial_response + continuation_text).strip()
                     updated_history[-1]["content"] = final_text
                     yield updated_history
             
@@ -1802,10 +1846,13 @@ def stream_chat(
             # Filter out model's internal reasoning tokens from continuation before appending
             continuation_clean = continuation_text
             internal_tokens = [
-                '<end_of_instructions>', 'thought process:', 'thinking:',
+                '<end_of_instructions>', '<end_of_turn>', 'thought process:', 'thinking:',
                 'reasoning:', 'internal:', 'meta:', '[thinking]', '[reasoning]',
-                'end_of_instructions', 'thought process', 'thinking process',
-                'okay, i need to finish', 'i need to finish', 'as though someone else'
+                'end_of_instructions', 'end_of_turn', 'thought process', 'thinking process',
+                'okay, i need to finish', 'i need to finish', 'as though someone else',
+                '<end_of_turn>thought', '<end_of_turn>', 'end_of_turn', 'thought',
+                'the prompt asks you', 'the user has stopped', 'provide steps involved',
+                'so provide steps', 'steps involved in developing'
             ]
             for token in internal_tokens:
                 continuation_clean = continuation_clean.replace(token, '')
@@ -1820,7 +1867,12 @@ def stream_chat(
                 # Skip lines that are clearly internal reasoning
                 if any(line_lower.startswith(pattern) for pattern in [
                     'thought process', 'thinking:', 'reasoning:', 'internal:',
-                    'okay, i need', 'i need to finish', 'as though someone'
+                    'okay, i need', 'i need to finish', 'as though someone',
+                    'the prompt asks you', 'the user has stopped', 'provide steps',
+                    'so provide steps', 'steps involved'
+                ]) or any(pattern in line_lower for pattern in [
+                    '<end_of_turn>', 'end_of_turn', 'thought process',
+                    'the prompt asks', 'the user has stopped responding'
                 ]):
                     continue
                 filtered_lines.append(line)
@@ -1844,7 +1896,7 @@ def stream_chat(
                             is_new = True
                             for orig_sent in original_sentences[-10:]:  # Check last 10 sentences
                                 sent_similarity = compute_semantic_similarity(orig_sent, cont_sent)
-                                if sent_similarity > 0.85:  # Very high similarity = duplicate
+                                if sent_similarity > 0.75:  # Very high similarity = duplicate (lowered for more graceful detection)
                                     is_new = False
                                     break
                             if is_new:
@@ -1872,7 +1924,7 @@ def stream_chat(
                                     is_new = True
                                     for prev_sent in prev_sentences[-10:]:
                                         sent_similarity = compute_semantic_similarity(prev_sent, cont_sent)
-                                        if sent_similarity > 0.85:
+                                        if sent_similarity > 0.75:  # Lowered for more graceful detection
                                             is_new = False
                                             break
                                     if is_new:
@@ -1886,11 +1938,23 @@ def stream_chat(
             
             # Append cleaned continuation to response only if it's on-topic and not empty
             if continuation_clean and len(continuation_clean.strip()) > 20:
+                # Log continuation content for tracking
+                logger.info(f"Continuation {continuation_count} added: {len(continuation_clean)} chars, starts with: '{continuation_clean[:100]}'")
                 partial_response += continuation_clean
                 final_text = partial_response.strip()
+                
+                # Track continuation content methodically
+                continuation_summary = {
+                    'count': continuation_count,
+                    'length': len(continuation_clean),
+                    'start': continuation_clean[:50],
+                    'end': continuation_clean[-50:] if len(continuation_clean) > 50 else continuation_clean
+                }
+                logger.info(f"Continuation summary: {continuation_summary}")
             else:
                 # If all continuation was filtered out or is duplicate, might be all internal reasoning
                 logger.warning(f"Continuation {continuation_count} was mostly internal reasoning or duplicate - discarding")
+                logger.warning(f"Filtered continuation length: {len(continuation_clean) if continuation_clean else 0} chars")
                 final_text = original_response_before_continuation
                 partial_response = original_response_before_continuation
                 is_complete = True
