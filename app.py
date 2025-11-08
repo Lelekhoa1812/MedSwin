@@ -1309,7 +1309,7 @@ def _stream_chat_impl(
     
     # Handle system prompt based on language and whether RAG is enabled
     if detected_lang == 'vi':
-    if context:
+        if context:
             # For Vietnamese with context, be more explicit about using only relevant context
             sys_text = f"{sys_text}\n\n[Lưu ý: Chỉ sử dụng thông tin từ ngữ cảnh tài liệu nếu nó liên quan trực tiếp đến câu hỏi.]\n\n[Document Context]\n{context}{source_info}"
         else:
@@ -1322,7 +1322,7 @@ def _stream_chat_impl(
         # For English/other languages
         if context:
             # Add context normally when RAG is enabled
-        sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}"
+            sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}"
         elif disable_retrieval:
             # When RAG is disabled, instruct model to use its own medical knowledge
             sys_text = f"{sys_text}\n\n[Note: Answer based on your medical knowledge.]"
