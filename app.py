@@ -3186,20 +3186,20 @@ def create_demo():
                         else:
                             # Reset gemini_client when switching to HuggingFace models
                             gemini_client = None
-                    if choice == "MedSwin-7B KD":
-                        name = MEDSWIN_KD_MODEL
-                    elif choice == "MedSwin-7B SFT":
-                        name = MEDSWIN_SFT_MODEL
-                    elif choice == "MedAlpaca-7B":
-                        name = MEDALPACA_MODEL
-                            elif choice == "MedGemma-27B":
-                        name = MEDGEMMA_MODEL
+                        if choice == "MedSwin-7B KD":
+                            name = MEDSWIN_KD_MODEL
+                        elif choice == "MedSwin-7B SFT":
+                            name = MEDSWIN_SFT_MODEL
+                        elif choice == "MedAlpaca-7B":
+                            name = MEDALPACA_MODEL
+                        elif choice == "MedGemma-27B":
+                            name = MEDGEMMA_MODEL
                             else:
                                 # Unknown choice, don't try to load anything
                                 return f"Unknown model: {choice}"
                             # Only load HuggingFace model if not using Gemini
-                    initialize_model_and_tokenizer(name)
-                    return f"Loaded: {choice}"
+                            initialize_model_and_tokenizer(name)
+                        return f"Loaded: {choice}"
                     except PermissionError as e:
                         error_msg = str(e)
                         logger.error(f"Model loading failed: {error_msg}")
