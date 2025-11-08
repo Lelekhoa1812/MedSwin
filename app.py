@@ -335,15 +335,16 @@ def _build_fallback_chat_prompt(messages, include_history: bool = True, max_hist
             # Only include if the last question is different from current question
             if recent_pairs and recent_pairs[-1][0] != last_user:
                 history_text = "\n".join([f"Q: {q}\nA: {a}" for q, a in recent_pairs])
-            instruction += f"\n\nContext Conversation (for background):\n{history_text}"
+            instruction += f"\n\nContext: {history_text}"
     
     if last_user:
-        instruction += f"\n\nTask: Answer the user's question.\nQuestion: {last_user}"
+        instruction += f"\n\nQuestion: {last_user}"
 
     return (
-        "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n"
+        "Task: Complete the request below.\n\n"
         "### Instruction:\n"
-        f"{instruction}\n\n"
+        f"{instruction}\n"
+        "Use plain text only - no tables or complex Markdown. Be concise and direct.\n\n"
         "### Response:\n"
     )
 
@@ -370,15 +371,17 @@ def build_prompt(messages, tokenizer, system_prompt: str, context: str, source_i
             pass
 
     # Fallback: instruct-style (works for non-chat causal LMs)
-    # Strong guardrails to avoid “As an AI…” style preambles
+    # Strong guardrails to avoid "As an AI…" style preambles
     instruct = (
         "### System\n"
         f"{sys}\n\n"
         "### Rules\n"
         "- Answer directly in clinical language.\n"
         "- Do not mention that you are an AI.\n"
-        "- Do not include meta commentary or apologies.\n"
-        "- Keep it concise and evidence-focused.\n\n"
+        "- Do not include meta commentary.\n"
+        "- Keep it concise and evidence-focused.\n"
+        "- Use plain text only - no tables or complex Markdown.\n"
+        "- Be brief and focused.\n\n"
         "### Conversation\n"
     )
     for m in messages:
@@ -965,14 +968,14 @@ def gemini_chat(
     # Handle system prompt based on language and whether RAG is enabled
     if detected_lang == 'vi':
         if context:
-            sys_text = f"{sys_text}\n\n[Lưu ý: Chỉ sử dụng thông tin từ ngữ cảnh tài liệu nếu nó liên quan trực tiếp đến câu hỏi.]\n\n[Document Context]\n{context}{source_info}"
+            sys_text = f"{sys_text}\n\n[Lưu ý: Chỉ dùng thông tin từ ngữ cảnh nếu liên quan. Dùng văn bản thuần - không bảng hay Markdown phức tạp. Trả lời ngắn gọn.]\n\n[Document Context]\n{context}{source_info}"
         else:
-            sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt dựa trên kiến thức y tế của bạn.]"
+            sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt, ngắn gọn, dùng văn bản thuần.]"
     else:
         if context:
-            sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}"
+            sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}\n[Note: Use plain text only - no tables or complex Markdown. Be concise.]"
         elif disable_retrieval:
-            sys_text = f"{sys_text}\n\n[Note: Answer based on your medical knowledge.]"
+            sys_text = f"{sys_text}\n\n[Note: Answer based on your medical knowledge. Use plain text only - no tables. Be concise.]"
     
     # Build conversation messages for Gemini
     convo_msgs = [{"role": "system", "content": sys_text}]
@@ -1311,21 +1314,21 @@ def _stream_chat_impl(
     if detected_lang == 'vi':
         if context:
             # For Vietnamese with context, be more explicit about using only relevant context
-            sys_text = f"{sys_text}\n\n[Lưu ý: Chỉ sử dụng thông tin từ ngữ cảnh tài liệu nếu nó liên quan trực tiếp đến câu hỏi.]\n\n[Document Context]\n{context}{source_info}"
+            sys_text = f"{sys_text}\n\n[Lưu ý: Chỉ dùng thông tin từ ngữ cảnh nếu liên quan. Dùng văn bản thuần - không bảng hay Markdown phức tạp. Trả lời ngắn gọn.]\n\n[Document Context]\n{context}{source_info}"
         else:
             # For Vietnamese without context (RAG disabled), emphasize using medical knowledge
             if disable_retrieval:
-                sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt dựa trên kiến thức y tế của bạn.]"
+                sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt, ngắn gọn, dùng văn bản thuần.]"
             else:
-                sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt dựa trên kiến thức y tế của bạn.]"
+                sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt, ngắn gọn, dùng văn bản thuần.]"
     else:
         # For English/other languages
         if context:
             # Add context normally when RAG is enabled
-            sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}"
+            sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}\n[Note: Use plain text only - no tables or complex Markdown. Be concise.]"
         elif disable_retrieval:
             # When RAG is disabled, instruct model to use its own medical knowledge
-            sys_text = f"{sys_text}\n\n[Note: Answer based on your medical knowledge.]"
+            sys_text = f"{sys_text}\n\n[Note: Answer based on your medical knowledge. Use plain text only - no tables. Be concise.]"
 
     # Reconstruct conversation for template with smart history filtering
     # Only include recent, relevant history to avoid confusion and hallucinations
@@ -2389,32 +2392,22 @@ def _stream_chat_impl(
                 if term in message_lower:
                     medical_context_keywords.append(term)
             
-            # Build enhanced continuation instruction with structured context
+            # Build simplified continuation instruction
             continuation_instruction_parts = []
             
-            # 1. Core instruction
-            continuation_instruction_parts.append("Continue the medical answer directly from the last sentence without interruption.")
+            # Core instruction
+            continuation_instruction_parts.append("Continue the medical answer directly from the last sentence.")
             
-            # 2. Context summary (what's been covered)
+            # Context summary (simplified)
             if covered_topics:
-                continuation_instruction_parts.append(f"Topics already covered: {', '.join(covered_topics[:3])}.")
+                continuation_instruction_parts.append(f"Covered: {', '.join(covered_topics[:2])}.")
             
-            # 3. Medical context (maintain medical focus)
+            # Medical context (simplified)
             if medical_context_keywords:
-                continuation_instruction_parts.append(f"Maintain focus on: {', '.join(medical_context_keywords[:3])}.")
+                continuation_instruction_parts.append(f"Focus: {', '.join(medical_context_keywords[:2])}.")
             
-            # 4. Structure guidance
-            if structure_hint:
-                continuation_instruction_parts.append(structure_hint.strip())
-            
-            # 5. Quality instructions - explicitly prevent commentary and meta-responses
-            continuation_instruction_parts.append("Provide factual medical information. Maintain clinical tone and precision.")
-            continuation_instruction_parts.append("Do NOT include meta-commentary, instructions, clarifications, or questions.")
-            continuation_instruction_parts.append("Do NOT acknowledge incomplete input or ask what the user wants.")
-            continuation_instruction_parts.append("Do NOT say things like 'sure', 'here is', 'to complete', 'followup answer', 'let me continue', etc.")
-            continuation_instruction_parts.append("Do NOT explain what you're doing or why you're continuing.")
-            continuation_instruction_parts.append("Simply continue the medical answer directly with facts and information.")
-            continuation_instruction_parts.append("Start immediately with the medical content, as if the previous sentence never ended.")
+            # Quality instructions (simplified and consolidated)
+            continuation_instruction_parts.append("Use plain text only - no tables or complex Markdown. Be concise. Continue directly with medical facts - no meta-commentary, questions, or explanations.")
             
             # Combine all instruction parts
             continuation_instruction = "\n".join(continuation_instruction_parts)
@@ -2429,17 +2422,13 @@ def _stream_chat_impl(
             if len(core_task) > 200:
                 core_task = core_task[:200] + "..."
             
-            # Build structured continuation prompt
+            # Build simplified continuation prompt
             continuation_prompt = (
                 f"{prompt}\n\n"
-                f"=== Original Question/Task ===\n"
-                f"{core_task}\n\n"
-                f"=== Previous Response (Incomplete) ===\n"
-                f"{response_context}\n\n"
-                f"=== Continuation Instructions ===\n"
-                f"{continuation_instruction}\n\n"
-                f"=== Continue From Here ===\n"
-                f"Continue directly from the last sentence above to complete the answer to: {core_task[:100]}"
+                f"Question: {core_task}\n"
+                f"Previous: {response_context}\n"
+                f"Instructions: {continuation_instruction}\n"
+                f"Continue:"
             )
             
             logger.info(f"Continuation prompt length: {len(continuation_prompt)} chars, structure hint: {bool(structure_hint)}")
@@ -3109,7 +3098,8 @@ def create_demo():
                     system_prompt = gr.Textbox(
                         value=(
                             "Answer clinically and concisely using the provided context. "
-                            "If context is insufficient, state what is missing. Cite filenames in brackets when used."
+                            "If context is insufficient, state what is missing. Cite filenames in brackets when used. "
+                            "Use plain text only - no tables or complex Markdown formatting. Keep responses brief and focused."
                         ),
                         label="System Prompt",
                         lines=3
